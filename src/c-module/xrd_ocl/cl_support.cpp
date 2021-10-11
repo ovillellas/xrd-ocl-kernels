@@ -122,7 +122,7 @@ get_platform_param(cl_platform_id platform, cl_platform_info param,
             if (CL_SUCCESS != errval)
                 break;
 
-            return_val = PyUnicode_FromString(ctxt->tmp_buffer);
+            return_val = PyUnicode_FromString(static_cast<const char*>(ctxt->tmp_buffer));
         }
     default:
         break;
@@ -373,21 +373,21 @@ get_device_param(cl_device_id device, cl_device_info param,
 
     case CLT_NTSTRING:
         {
-            return_val = PyUnicode_FromString(ctxt->tmp_buffer);
+            return_val = PyUnicode_FromString(static_cast<const char*>(ctxt->tmp_buffer));
         }
         break;
 
     case CLT_PLATFORM_ID:
         {
-            cl_platform_id the_value = *(cl_platform_id *)ctxt->tmp_buffer;
-            return_val = PyLong_FromSize_t(the_value);
+            cl_platform_id the_value = *static_cast<cl_platform_id *>(ctxt->tmp_buffer);
+            return_val = PyLong_FromSize_t(reinterpret_cast<size_t>(the_value));
         }
         break;
 
     case CLT_DEVICE_ID:
         {
-            cl_device_id the_value = *(cl_device_id *)ctxt->tmp_buffer;
-            return_val = PyLong_FromSize_t(the_value);
+            cl_device_id the_value = *static_cast<cl_device_id *>(ctxt->tmp_buffer);
+            return_val = PyLong_FromSize_t(reinterpret_cast<size_t>(the_value));
         }
         break;
 
@@ -659,7 +659,7 @@ describe_platform(cl_platform_id platform, get_info_ctxt *ctxt)
         cl_device_id *devices;
 
         clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &num_devices);
-        devices = calloc(num_devices, sizeof(cl_device_id));
+        devices = static_cast<cl_device_id*>(calloc(num_devices, sizeof(cl_device_id)));
         if (NULL != devices)
         {
             /* highly unlikely that the previous allocation will fail. That would
@@ -717,7 +717,7 @@ python_cl_get_info(PyObject *self)
 
     if (platform_count > 0)
     {
-        platforms = calloc(platform_count, sizeof(cl_platform_id));
+        platforms = static_cast<cl_platform_id*>(calloc(platform_count, sizeof(cl_platform_id)));
         if (NULL == platforms)
         {
             PyErr_SetString(PyExc_RuntimeError, "Out of Memory?!?!");

@@ -26,7 +26,9 @@
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 
+extern "C" {
 #include <Python.h>
+}
 /*#include <numpy/arrayobject.h>*/
 
 /* =============================================================================
@@ -89,13 +91,13 @@
  */
 
 #define EXPORT_METHOD_NA(name) \
-    { STR(name), CONCAT(python_, name), METH_NOARGS, NULL } 
+    { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_NOARGS, NULL } 
 
 #define EXPORT_METHOD_VA(name) \
-    { STR(name), CONCAT(python_, name), METH_VARARGS, NULL }
+    { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_VARARGS, NULL }
 
 #define EXPORT_METHOD_KW(name) \
-    { STR(name), CONCAT(python_, name), METH_KEYWORDS, NULL }
+    { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_KEYWORDS, NULL }
 
 #define EXPORT_METHOD_SENTINEL() \
     { NULL, NULL, 0, NULL }
