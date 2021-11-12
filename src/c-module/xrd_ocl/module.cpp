@@ -24,12 +24,18 @@
 
 /* ************************************************************************** */
 
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 
+#include "compiler.hpp"
 extern "C" {
 #include <Python.h>
+
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
 }
-/*#include <numpy/arrayobject.h>*/
+
+#include <OpenCL/opencl.h>
+
+
 
 /* =============================================================================
  * Note: As we really want to only the entry point of the module to be visible
@@ -96,8 +102,8 @@ extern "C" {
 #define EXPORT_METHOD_VA(name) \
     { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_VARARGS, NULL }
 
-#define EXPORT_METHOD_KW(name) \
-    { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_KEYWORDS, NULL }
+#define EXPORT_METHOD_VAKW(name) \
+    { STR(name), reinterpret_cast<PyCFunction>(CONCAT(python_, name)), METH_VARARGS | METH_KEYWORDS, NULL }
 
 #define EXPORT_METHOD_SENTINEL() \
     { NULL, NULL, 0, NULL }
@@ -105,7 +111,7 @@ extern "C" {
 
 static PyMethodDef _module_methods[] = {
     EXPORT_METHOD_NA(cl_get_info),
-    EXPORT_METHOD_VA(cl_gvec_to_xy),
+    EXPORT_METHOD_VAKW(cl_gvec_to_xy),
     EXPORT_METHOD_SENTINEL()
 };
 
@@ -141,7 +147,7 @@ CONCAT(PyInit_, THIS_MODULE_NAME)(void)
     if (NULL != module)
     {
         /* add any extra initialization */    
-    /*    import_array(); */
+        import_array();
     }
     return module;
 }

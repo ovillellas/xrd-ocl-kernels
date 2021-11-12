@@ -1,5 +1,3 @@
-#include <stdio.h>
-#include <OpenCL/opencl.h>
 
 
 #define COUNT_OF(x) (sizeof(x)/sizeof(x[0]))
@@ -91,7 +89,7 @@ typedef struct cl_platform_info_entry_struct
     cl_type param_type;
 } cl_platform_info_entry;
 
-cl_platform_info_entry platform_params[] = {
+static cl_platform_info_entry platform_params[] = {
     { CL_PLATFORM_PROFILE, "profile", CLT_NTSTRING },
     { CL_PLATFORM_VERSION, "version", CLT_NTSTRING },
     { CL_PLATFORM_NAME, "name", CLT_NTSTRING },
@@ -137,7 +135,7 @@ typedef struct cl_device_info_entry_struct
     cl_type param_type;
 } cl_device_info_entry;
 
-cl_device_info_entry device_params[] =
+static cl_device_info_entry device_params[] =
 {
     { CL_DEVICE_TYPE, "type", CLT_DEVICE_TYPE },
     { CL_DEVICE_VENDOR_ID, "vendor_id", CLT_UINT },

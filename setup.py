@@ -37,6 +37,11 @@ versioneer.parentdir_prefix = 'xrd-ocl-kernels-v'
 xrd_ocl_extension = Extension(
     'xrd_ocl_kernels.xrd_ocl',
     sources=['src/c-module/xrd_ocl/module.cpp'],
+    include_dirs=[numpy.get_include()],
+    extra_compile_args=[
+        '-std=c++11',
+        '-fno-exceptions',
+        ],
     extra_link_args=[
         '-framework', 'OpenCL'
         ],
