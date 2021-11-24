@@ -89,6 +89,7 @@ extern "C" {
 #include "quat_distance.c"
 */
 
+#include "cl_instance.cpp"
 #include "cl_support.cpp"
 #include "cl_gvec_to_xy.cpp"
 /* =============================================================================

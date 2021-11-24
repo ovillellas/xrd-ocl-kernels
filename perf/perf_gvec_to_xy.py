@@ -66,7 +66,7 @@ def some_fancy_generator_of_rotation_matrices(count):
     result[:] = np.eye(3)
     return result
 
-def build_args(args):
+def build_args(ngvec, npos, single_s):
     '''build some sample args for gvec_to_xy. Anything will do as long as it is
     appropriate.
     gvec_to_xy requires the following:
@@ -82,11 +82,9 @@ def build_args(args):
     depending on the 'single_s' argument, either 1 (if present) or COUNT
     rmat_s will be generated.
     '''
-    ngvec = args.ngvec
-    npos = args.npos
     gvecs = some_fancy_generator_of_unit_vectors(ngvec)
     rmat_d = np.eye(3) # as in test suite
-    if not args.single_s:
+    if not single_s:
         rmat_s = some_fancy_generator_of_rotation_matrices(ngvec)
     else:
         # taken from test suite
@@ -114,7 +112,7 @@ def run_test(args):
     global impl_fn
     impl_to_run = build_impls(args.impl)
 
-    sample_args = build_args(args)
+    sample_args = build_args(args.ngvec, args.npos, args.single_s)
 
     print(f"Running gvec_to_xy ngvec: {args.ngvec} npos: {args.npos} single rMat_s: {args.single_s}")
     for name in impl_to_run:

@@ -26,15 +26,17 @@ named_array_type_to_str(named_array_type t)
 }
 
 enum named_array_dim {
-    na_0d_only = 1,
-    na_1d_only = 2,
-    na_0d_or_1d = 3
+    na_0d_or_none = 1,
+    na_0d_only = 2,
+    na_1d_only = 3,
+    na_0d_or_1d = 4
 };
 
 static const char *
 named_array_dim_to_str(named_array_dim d)
 {
     switch(d) {
+    case na_0d_or_none: return "an optional";
     case na_0d_only: return "a single";
     case na_1d_only: return "a 1 dimensional array of";
     case na_0d_or_1d: return "a single or a 1 dimensional array of";
@@ -140,6 +142,15 @@ named_array_converter(PyObject *op, void *result)
     int inner_dims, outer_dims, total_dims;
     auto na = static_cast<named_array *>(result);
 
+    if (op == Py_None && na_0d_or_none == na->dim_kind)
+    {
+        /* this one is ok. Just place a null in the pyarray.
+           all other cases will go through the generic array path.
+        */
+        na->pyarray = nullptr;
+        return 1;
+    }
+    
     if (!is_valid_array(op))
         goto fail;
 
@@ -161,6 +172,7 @@ named_array_converter(PyObject *op, void *result)
 
         outer_dims = total_dims - inner_dims;
         switch (na->dim_kind) {
+        case na_0d_or_none:
         case na_0d_only:
             if (outer_dims != 0)
                 goto fail;

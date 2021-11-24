@@ -1,6 +1,7 @@
 #ifndef XRD_OCL_UTILS_HPP
 #define XRD_OCL_UTILS_HPP
 
+#include "checks.hpp"
 #include <cstdint>
 #include <type_traits>
 
@@ -310,14 +311,14 @@ template <>
 constexpr const char *
 floating_kind_name<float>()
 {
-    return "single precision float";
+    return "float32";
 }
 
 template <>
 constexpr const char *
 floating_kind_name<double>()
 {
-    return "double precision float";
+    return "float64";
 }
 
 template <typename REAL>
