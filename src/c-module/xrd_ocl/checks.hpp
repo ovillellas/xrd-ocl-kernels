@@ -66,7 +66,8 @@ is_valid_array(PyObject *op)
 }
 
 
-static bool check_inner_dims(const PyArrayObject *aop, int ndim, ...)
+static inline bool
+check_inner_dims(const PyArrayObject *aop, int ndim, ...)
 {
     auto aop_ndim = PyArray_NDIM(aop);
     if (aop_ndim < ndim)

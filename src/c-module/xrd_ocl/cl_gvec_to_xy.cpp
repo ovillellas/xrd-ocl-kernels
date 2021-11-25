@@ -269,13 +269,11 @@ __kernel void gvec_to_xy(
     __global const REAL *g_tVec_c,
     __global REAL * restrict g_xy_result)
 {
-//    size_t element = get_global_id(0);
     size_t gvec_idx = get_global_id(0);
     size_t pos_idx = get_global_id(1);
     uint ngvec = params->chunk_size[0];
     uint npos = params->chunk_size[1];
-//    uint gvec_idx = element / npos;
-//    uint npos_idx = element % npos;
+
     /* handle border case */
     if (gvec_idx >= ngvec || pos_idx >= npos)
         return;
@@ -306,34 +304,6 @@ __kernel void gvec_to_xy(
         rMat_s2 = vload3(2, params->rMat_s);
     }
 
-/*    if (element==0)
-    {
-       printf("\n\nwhat: %9.4v3hlf\n", rMat_c0);
-       printf("test: %9.4f %9.4f %9.4f\n", rMat_c0.x, rMat_c0.y, rMat_c0.z);
-       printf("gVec_c:\n");
-       printf("%9.4v3hlf\n", gVec_c);
-       printf("rMat_d:\n");
-       printf("%9.4v3hlf\n", rMat_d0);
-       printf("%9.4v3hlf\n", rMat_d1);
-       printf("%9.4v3hlf\n", rMat_d2);
-       printf("rMat_s:\n");
-       printf("%9.4v3hlf\n", rMat_s0);
-       printf("%9.4v3hlf\n", rMat_s1);
-       printf("%9.4v3hlf\n", rMat_s2);
-       printf("rMat_c:\n");
-       printf("%9.4v3hlf\n", rMat_c0);
-       printf("%9.4v3hlf\n", rMat_c1);
-       printf("%9.4v3hlf\n", rMat_c2);
-       printf("tVec_d:\n");
-       printf("%9.4v3hlf\n", tVec_d);
-       printf("tVec_s:\n");
-       printf("%9.4v3hlf\n", tVec_s);
-       printf("tVec_c:\n");
-       printf("%9.4v3hlf\n", tVec_c);
-       printf("beam:\n");
-       printf("%9.4v3hlf\n", beam);
-    }
-*/
     REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
     REAL3 gVec_sam = rotate_vector(rMat_c0, rMat_c1, rMat_c2, gVec_c);
     REAL3 gVec_lab = rotate_vector(rMat_s0, rMat_s1, rMat_s2, gVec_sam);
@@ -449,7 +419,7 @@ init_g2xy_buffs(g2xy_buffs *return_state,
 }
 
 
-static void
+static inline void
 raw_copy_to_buffer(cl_command_queue queue, cl_mem buffer, const void *srcdata, size_t sz)
 {
     void *mapped = clEnqueueMapBuffer(queue, buffer, CL_TRUE,
@@ -459,7 +429,7 @@ raw_copy_to_buffer(cl_command_queue queue, cl_mem buffer, const void *srcdata, s
     clEnqueueUnmapMemObject(queue, buffer, mapped, 0, NULL, NULL);
 }
 
-static void
+static inline void
 raw_copy_from_buffer(cl_command_queue queue, cl_mem buffer, void *dstdata, size_t sz)
 {
     void *mapped = clEnqueueMapBuffer(queue, buffer, CL_TRUE,
@@ -730,13 +700,13 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
         if (numpy_type<REAL>() == stream->base_type)
         {
             // check if strides are just the size of the underlying dimensions
-            size_t sz = sizeof(REAL);
-             int i;
+            ptrdiff_t contiguous_stride = sizeof(REAL);
+            int i;
             for (i = total_ndim-1; i>=0; i--)
             {
-                if (strides[i] != sz)
+                if (strides[i] != contiguous_stride)
                     break;
-                sz *= dims[i];
+                contiguous_stride *= dims[i];
             }
             // at this point, i should have the dimension upto which the inner
             // dimensions are trivial, and sz the size of those inner dimensions
@@ -752,7 +722,6 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
 
     if (trivial_layout)
     { /* do this in slices to see how fast we can go */
-        void *src;
         sliced_buff_to_mem(queue, buffer, dst, total_size, CLXF_PREFERRED_SLICE_SIZE);
     }
     else
