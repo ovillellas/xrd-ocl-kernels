@@ -120,7 +120,7 @@ def run_test(args):
         setup_str = (f"from __main__ import sample_args, impl_fn\n")
 
         results = timeit.repeat(stmt=f"impl_fn(*sample_args)",
-                                setup=setup_str, repeat=3, number=3)
+                                setup=setup_str, repeat=3, number=1)
         print(f"{name:12}: {min(results):8.4} secs")
 
     del sample_args
