@@ -12,6 +12,13 @@ zap_to_zero(T& to_zap)
     memset(&to_zap, 0, sizeof(to_zap));
 }
 
+template <typename T>
+static inline T
+next_multiple(T base, T multiple)
+{
+    static_assert(std::is_integral<T>::value, "only for integral types");
+    return multiple*(1+(base-1)/multiple);
+}
 
 // byte_index will offset the base pointer by 'offset' in bytes. This maps
 // pretty well to what NumPy uses. Just dividing the offset by sizeof wouldn't
@@ -363,6 +370,7 @@ struct stream_desc {
     const ptrdiff_t *element_strides() const { return &strides[ndim_outer]; }
     const size_t *stream_dims() const { return &dims[0]; }
     const size_t *element_dims() const { return &dims[ndim_outer]; }
+
 };
 
 /*

@@ -4,6 +4,8 @@
 
 #include <algorithm> // std::max
 
+#define CLXF_PREFERRED_SLICE_SIZE (4*1024*1024)
+
 // parameters for use in gvec_to_xy. Templatized to support both, float and
 // double versions.
 template <typename REAL>
@@ -60,7 +62,7 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
         zap_to_zero(params->gVec_c);
         array_stream_convert(&streams->gVec_c_stream, pa_gVec_c, 1, 1);
     }
-    
+
     array_matrix33_autoconvert<REAL>(params->rMat_d, pa_rMat_d);
 
     if (!is_streaming_matrix33(pa_rMat_s))
@@ -73,7 +75,7 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
         zap_to_zero(params->rMat_s);
         array_stream_convert(&streams->rMat_s_stream, pa_rMat_s, 2, 1);
     }
-    
+
     array_matrix33_autoconvert<REAL>(params->rMat_c, pa_rMat_c);
     array_vector3_autoconvert<REAL>(params->tVec_d, pa_tVec_d);
     array_vector3_autoconvert<REAL>(params->tVec_s, pa_tVec_s);
@@ -104,7 +106,7 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
 
     size_t ngvec = streams->xy_out_stream.stream_dims()[0];
     size_t npos = streams->xy_out_stream.stream_dims()[1];
-    
+
     params->chunk_size[0] = static_cast<cl_uint>(ngvec);
     params->chunk_size[1] = static_cast<cl_uint>(npos);
     params->total_size[0] = static_cast<cl_uint>(ngvec);
@@ -267,20 +269,18 @@ __kernel void gvec_to_xy(
     __global const REAL *g_tVec_c,
     __global REAL * restrict g_xy_result)
 {
-    size_t element = get_global_id(0);
+//    size_t element = get_global_id(0);
+    size_t gvec_idx = get_global_id(0);
+    size_t pos_idx = get_global_id(1);
     uint ngvec = params->chunk_size[0];
     uint npos = params->chunk_size[1];
-    uint gvec_idx = element / npos;
-    uint npos_idx = element % npos;
+//    uint gvec_idx = element / npos;
+//    uint npos_idx = element % npos;
     /* handle border case */
-
-    if (gvec_idx >= ngvec)
-    {
-        printf("skipped element %llu\n", element);
+    if (gvec_idx >= ngvec || pos_idx >= npos)
         return;
-    }
 
-    REAL3 tVec_c = vload3(npos_idx, g_tVec_c);
+    REAL3 tVec_c = vload3(pos_idx, g_tVec_c);
     REAL3 gVec_c = vload3(gvec_idx, g_gVec_c);
     REAL3 rMat_s0, rMat_s1, rMat_s2;
     REAL3 rMat_c0 = vload3(0, params->rMat_c),
@@ -310,7 +310,7 @@ __kernel void gvec_to_xy(
     {
        printf("\n\nwhat: %9.4v3hlf\n", rMat_c0);
        printf("test: %9.4f %9.4f %9.4f\n", rMat_c0.x, rMat_c0.y, rMat_c0.z);
-       printf("gVec_c:\n"); 
+       printf("gVec_c:\n");
        printf("%9.4v3hlf\n", gVec_c);
        printf("rMat_d:\n");
        printf("%9.4v3hlf\n", rMat_d0);
@@ -333,7 +333,7 @@ __kernel void gvec_to_xy(
        printf("beam:\n");
        printf("%9.4v3hlf\n", beam);
     }
-*/  
+*/
     REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
     REAL3 gVec_sam = rotate_vector(rMat_c0, rMat_c1, rMat_c2, gVec_c);
     REAL3 gVec_lab = rotate_vector(rMat_s0, rMat_s1, rMat_s2, gVec_sam);
@@ -345,178 +345,7 @@ __kernel void gvec_to_xy(
 
     REAL2 projected = to_detector(rMat_d0, rMat_d1, rMat_d2, tVec_d, ray_origin, ray_vector);
 
-    vstore2(projected, element, g_xy_result);
-}
-)CLC";
-
-// C++11 raw string literals to the rescue... will make cl programs legible.
-static const char *g2xy_source2 = R"CLC(
-#if defined(USE_SINGLE_PRECISION) && USE_SINGLE_PRECISION
-#  define REAL float
-#else
-#  pragma OPENCL EXTENSION cl_khr_fp64: enable
-#  define REAL double
-#endif
-
-struct problem_size_t
-{
-    unsigned long ngvec;
-    unsigned long npos;
-};
-
-struct gvec_to_xy_params {
-    REAL gVec_c[3];
-    REAL rMat_d[9];
-    REAL rMat_s[9];
-    REAL rMat_c[9];
-    REAL tVec_d[3];
-    REAL tVec_s[3];
-    REAL tVec_c[3];
-    struct problem_size_t chunk_size;
-    struct problem_size_t total_size;
-};
-
-
-void v3s_copy(const REAL *src, ptrdiff_t stride, REAL * restrict dst)
-{
-    dst[0] = src[0];
-    dst[1] = src[stride];
-    dst[2] = src[2*stride];
-}
-
-void v3_v3s_add(const REAL *src1, const REAL *src2, ptrdiff_t stride,
-                REAL * restrict dst)
-{
-    dst[0] = src1[0] + src2[0];
-    dst[1] = src1[1] + src2[1*stride];
-    dst[2] = src1[2] + src2[2*stride];
-}
-
-void v3_v3s_sub(const REAL *src1, const REAL *src2, ptrdiff_t stride,
-                REAL * restrict dst)
-{
-    dst[0] = src1[0] - src2[0];
-    dst[1] = src1[1] - src2[1*stride];
-    dst[2] = src1[2] - src2[2*stride];
-}
-
-REAL v3_v3s_dot(const REAL *v1,
-                const REAL *v2, ptrdiff_t stride)
-{
-    return v1[0]*v2[0] + v1[1]*v2[stride] + v1[2]*v2[2*stride];
-}
-
-
-void m33_v3s_multiply(const REAL *m, const REAL *v, ptrdiff_t stride,
-                      REAL * restrict dst)
-{
-    dst[0] = m[0]*v[0] + m[3]*v[stride] + m[6]*v[2*stride];
-    dst[1] = m[1]*v[0] + m[4]*v[stride] + m[7]*v[2*stride];
-    dst[2] = m[2]*v[0] + m[5]*v[stride] + m[8]*v[2*stride];
-}
-
-
-void v3s_s_v3_muladd(const REAL *v1, ptrdiff_t stride, REAL factor,
-                     const REAL *v2, REAL * restrict result)
-{
-    /* result = v1*factor + v2 */
-    result[0] = factor*v1[0] + v2[0];
-    result[1] = factor*v1[1*stride] + v2[1];
-    result[2] = factor*v1[2*stride] + v2[2];
-}
-
-
-void diffract_z(const REAL *gvec, REAL * restrict diffracted)
-{
-    diffracted[0] = 2*gvec[0]*gvec[2];
-    diffracted[1] = 2*gvec[1]*gvec[2];
-    diffracted[2] = 2*gvec[2]*gvec[2] - 1.0;
-}
-
-
-int ray_plane_intersect(const REAL *origin, const REAL *vect,
-                        const REAL *plane, REAL * restrict collision_point)
-{
-    double t;
-    t = (plane[3] - v3_v3s_dot(plane, origin, 1)) / v3_v3s_dot(plane, vect, 1);
-    if (t < 0.0)
-        return 0;
-    v3s_s_v3_muladd(vect, 1, t, origin, collision_point); 
-    return 1;
-}
-
-
-void gvec_to_xy_single(const REAL *gVec_c,
-    const REAL *rMat_d, const REAL *rMat_s, const REAL *rMat_c,
-    const REAL *tVec_d, const REAL *tVec_s, const REAL *tVec_c,
-    REAL * restrict xy_result)
-{
-    REAL plane[4], tVec_sc[3], tVec_ds[3], gVec_s[3], gVec_l[3];
-    REAL ray_origin[3], ray_vector[3], point[3];
-    REAL rMat_sc[9];
-
-    v3s_copy(rMat_d + 2, 3, plane);
-    plane[3] = 0.0;
-
-    v3_v3s_sub(tVec_s, tVec_d, 1, tVec_ds);
-
-    m33_v3s_multiply(rMat_s, tVec_c, 1, tVec_sc);
-    v3_v3s_add(tVec_ds, tVec_sc, 1, ray_origin);
-
-    m33_v3s_multiply(rMat_c, gVec_c, 1, gVec_s);
-    m33_v3s_multiply(rMat_s, gVec_s, 1, gVec_l);
-
-    diffract_z(gVec_l, ray_vector);
-
-    if (0 != ray_plane_intersect(ray_origin, ray_vector, plane, point))
-    {
-        xy_result[0] = v3_v3s_dot(rMat_d, point, 1);
-        xy_result[1] = v3_v3s_dot(rMat_d + 3, point, 1); 
-    }
-    else
-    {
-        xy_result[0] = NAN;
-        xy_result[1] = NAN;
-    }
-}
-
-void g2l(REAL *dst, __global const REAL *src, size_t sz)
-{
-    for (size_t i=0; i<sz; i++) dst[i] = src[i];
-}
-
-void l2g(__global REAL *dst, const REAL *src, size_t sz)
-{
-    for (size_t i=0; i<sz; i++) dst[i] = src[i];
-}
-
-__kernel void gvec_to_xy(
-    __constant const struct gvec_to_xy_params *g_params,
-    __global const REAL *g_gVec_c,
-    __global const REAL *g_rMat_s,
-    __global const REAL *g_tVec_c,
-    __global REAL * restrict g_xy_result)
-{
-   REAL gVec_c[3], rMat_d[9], rMat_s[9], rMat_c[9], tVec_d[3], tVec_s[3], tVec_c[3];
-   REAL xy_result[2];
-   size_t gvec_idx, npos_idx, xy_result_offset;
-   gvec_idx = get_global_id(0);
-   npos_idx = get_global_id(1);
-
-   g2l(gVec_c, g_gVec_c + 3*gvec_idx, 3);
-   g2l(rMat_d, g_params->rMat_d, 9);
-   g2l(rMat_s, g_params->rMat_s + 9*gvec_idx, 9);
-   g2l(rMat_c, g_params->rMat_c, 9);
-   g2l(tVec_d, g_params->tVec_d, 3);
-   g2l(tVec_s, g_params->tVec_s, 3);
-   g2l(tVec_c, g_tVec_c + 3*npos_idx, 3);
-
-   /* first, naive implementation that just does one evaluation per item */
-   gvec_to_xy_single(gVec_c, rMat_d, rMat_s, rMat_c, tVec_d, tVec_s, tVec_c,
-                     xy_result);   
-
-   xy_result_offset = 2*(g_params->total_size.npos*gvec_idx + npos_idx);
-   l2g(g_xy_result + xy_result_offset, xy_result, 2);
+    vstore2(projected, gvec_idx*npos + pos_idx , g_xy_result);
 }
 )CLC";
 
@@ -546,7 +375,7 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     g2xy_buffs buffs;
     zap_to_zero(buffs);
     zap_to_zero(*return_state);
-    
+
     // params buffer, remains constant for the whole execution.
     {
         const cl_mem_flags buff_flags = CL_MEM_READ_ONLY |
@@ -565,7 +394,7 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     //
     // It should be possible to double buffer copy-convert and execution so that
     // copy-convert time is overlapped with actual computation in the GPU.
-    
+
     if (streams->gVec_c_stream.is_active())
     {
         size_t buff_size = 3*sizeof(REAL)*params->chunk_size[0];
@@ -640,7 +469,7 @@ raw_copy_from_buffer(cl_command_queue queue, cl_mem buffer, void *dstdata, size_
     memcpy(dstdata, mapped, sz);
     clEnqueueUnmapMemObject(queue, buffer, mapped, 0, NULL, NULL);
 }
-    
+
 //
 // copy convert into a given buffer contents from the stream_desc pointed by
 // stream. The type on the destination buffer is based on the template, while
@@ -755,7 +584,7 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
     const ptrdiff_t *strides = stream->stream_strides();
     const void *src = ndim_index(stream->base, pos, strides,
                                  stream->stream_ndim());
-    
+
     //printf("q: %p b: %p - WRITE_INVALIDATE - sz: %zd.\n", queue, buffer, total_size);
     void *dst = clEnqueueMapBuffer(queue, buffer, CL_TRUE,
                                    CL_MAP_WRITE_INVALIDATE_REGION,
@@ -777,6 +606,82 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
     return err;
 }
 
+// perform a cl_buffer to main memory slicing to a max size so that DMA and
+// memcpy may be overlapped.
+static void
+sliced_buff_to_mem(cl_command_queue queue, cl_mem buffer, void *dst, size_t total_size, size_t slice_size)
+{
+    const size_t SLICE_SIZE = slice_size;
+
+    if (total_size < 2*SLICE_SIZE)
+    {   TIME_SCOPE("sliced_buff_to_mem: under threshold");
+        void *src;
+        {
+            src = clEnqueueMapBuffer(queue, buffer, CL_TRUE, CL_MAP_READ, 0,
+                                     total_size, 0, NULL, NULL, NULL);
+        }
+        memcpy(dst, src, total_size);
+    }
+    else
+    {   TIME_SCOPE("sliced_buff_to_mem: the real deal");
+        cl_context the_context;
+        cl_mem pinned_buffer;
+        void *staging_mem;
+        cl_event pending[2];
+        int curr_buff = 0, next_buff = 1; // buffer that needs memcpy...
+        size_t curr_offset = 0;
+        size_t next_offset = SLICE_SIZE;
+        CL_LOG_CHECK(clGetCommandQueueInfo(queue, CL_QUEUE_CONTEXT, sizeof(the_context), &the_context, NULL));
+        pinned_buffer = clCreateBuffer(the_context, CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
+                                       2*SLICE_SIZE, NULL, NULL);
+
+        staging_mem = clEnqueueMapBuffer(queue, pinned_buffer, CL_TRUE, CL_MAP_READ,
+                                        0, 2*SLICE_SIZE, 0, NULL, NULL, NULL);
+
+        CL_LOG_CHECK(clEnqueueCopyBuffer(queue, buffer, pinned_buffer, curr_offset, curr_buff*SLICE_SIZE,
+                                         SLICE_SIZE, 0, NULL, pending + curr_buff));
+        /*
+        staging[curr_buff] = clEnqueueMapBuffer(queue, buffer, CL_FALSE, CL_MAP_READ,
+                                                curr_offset, SLICE_SIZE, 0, NULL,
+                                                pending + curr_buff, NULL);
+        */
+        do {
+            // copy next
+            CL_LOG_CHECK(clEnqueueCopyBuffer(queue, buffer, pinned_buffer, next_offset, next_buff*SLICE_SIZE,
+                                             std::min(SLICE_SIZE, total_size-next_offset), 0, NULL, pending+next_buff));
+            /*
+            staging[1-curr_buff] = clEnqueueMapBuffer(queue, buffer, CL_FALSE, CL_MAP_READ,
+                                                      next_offset, std::min(SLICE_SIZE, total_size-next_offset),
+                                                      0, NULL, pending + (1-curr_buff), NULL);
+            */
+            // wait for dma for current to finish
+            CL_LOG_CHECK(clWaitForEvents(1, pending+curr_buff));
+
+            // memcpy current buffer
+            memcpy(byte_index(dst, curr_offset),
+                   byte_index(staging_mem, curr_buff*SLICE_SIZE), SLICE_SIZE);
+
+            /*
+            // unmap previous buffer
+            clEnqueueUnmapMemObject(queue, buffer, staging[curr_buff], 0, NULL, NULL);
+            */
+            curr_buff = 1-curr_buff;
+            next_buff = 1-next_buff;
+            curr_offset += SLICE_SIZE;
+            next_offset += SLICE_SIZE;
+        } while(next_offset < total_size);
+
+        // last buffer needs memcpying
+        CL_LOG_CHECK(clWaitForEvents(1, pending+curr_buff));
+        memcpy(byte_index(dst, curr_offset),
+               byte_index(staging_mem, curr_buff*SLICE_SIZE), total_size-curr_offset);
+        //clEnqueueUnmapMemObject(queue, buffer, staging[curr_buff], 0, NULL, NULL);
+
+        CL_LOG_CHECK(clEnqueueUnmapMemObject(queue, pinned_buffer, staging_mem, 0, NULL, NULL));
+        CL_LOG_CHECK(clReleaseMemObject(pinned_buffer));
+    }
+}
+
 template <typename REAL>
 inline array_copy_convert_error
 copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
@@ -791,9 +696,14 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
     if (stream->base_type != NPY_FLOAT32 && stream->base_type != NPY_FLOAT64)
         return BASETYPE_ERROR;
 
+
     size_t total_ndim = stream->ndim();
 
     size_t dims[total_ndim];
+    const ptrdiff_t *strides = stream->stream_strides();
+    void * restrict dst = ndim_index(stream->base, pos, strides,
+                                     stream->stream_ndim());
+
     size_t total_size = 0;
     switch(stream->base_type) {
     case NPY_FLOAT:
@@ -808,32 +718,65 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
         dims[i] = sz[i];
         total_size *= sz[i];
     }
+
     for (size_t i = 0; i < stream->element_ndim(); i++) {
         dims[ndim+i] = stream->element_dims()[i];
         total_size *= stream->element_dims()[i];
     }
 
-    const ptrdiff_t *strides = stream->stream_strides();
-    void * restrict dst = ndim_index(stream->base, pos, strides,
-                                     stream->stream_ndim());
-    //printf("q: %p b: %p - READ - sz: %zd.\n", queue, buffer, total_size);
-    void *src;
-    { TIME_SCOPE("copy_convert_from_buffer: clEnqueueMapBuffer");
-        src = clEnqueueMapBuffer(queue, buffer, CL_TRUE, CL_MAP_READ, 0,
-                                 total_size, 0, NULL, NULL, NULL);
-    }
-    switch(stream->base_type)
+    // check for trivial layout of the stream...
+    bool trivial_layout = true;
     {
-    case NPY_FLOAT32:
-        copy_convert_chunk_out<float, REAL>(dst, src, dims, strides, total_ndim);
-        break;
-    case NPY_FLOAT64:
-        copy_convert_chunk_out<double, REAL>(dst, src, dims, strides, total_ndim);
-        break;
-    default:
-        err = UNEXPECTED_ERROR;
+        if (numpy_type<REAL>() == stream->base_type)
+        {
+            // check if strides are just the size of the underlying dimensions
+            size_t sz = sizeof(REAL);
+             int i;
+            for (i = total_ndim-1; i>=0; i--)
+            {
+                if (strides[i] != sz)
+                    break;
+                sz *= dims[i];
+            }
+            // at this point, i should have the dimension upto which the inner
+            // dimensions are trivial, and sz the size of those inner dimensions
+            // ... this could be used for some optimization.
+            trivial_layout = i < 0;
+        }
+        else
+        {
+            // bad luck, needs conversion...
+            trivial_layout = false;
+        }
     }
-    clEnqueueUnmapMemObject(queue, buffer, src, 0, NULL, NULL);
+
+    if (trivial_layout)
+    { /* do this in slices to see how fast we can go */
+        void *src;
+        sliced_buff_to_mem(queue, buffer, dst, total_size, CLXF_PREFERRED_SLICE_SIZE);
+    }
+    else
+    {
+        void *src;
+        { TIME_SCOPE("copy_convert_from_buffer: clEnqueueMapBuffer");
+            src = clEnqueueMapBuffer(queue, buffer, CL_TRUE, CL_MAP_READ, 0,
+                                     total_size, 0, NULL, NULL, NULL);
+        }
+
+        TIME_SCOPE("copy_convert_from_buffer: non-trivial copy-conversion");
+        switch(stream->base_type)
+        {
+        case NPY_FLOAT32:
+            copy_convert_chunk_out<float, REAL>(dst, src, dims, strides, total_ndim);
+            break;
+        case NPY_FLOAT64:
+            copy_convert_chunk_out<double, REAL>(dst, src, dims, strides, total_ndim);
+            break;
+        default:
+            err = UNEXPECTED_ERROR;
+        }
+        clEnqueueUnmapMemObject(queue, buffer, src, 0, NULL, NULL);
+    }
 
     return err;
 }
@@ -865,7 +808,7 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
         else
             return -2;
     }
-    
+
     gvec_to_xy_params<REAL> params;
     gvec_to_xy_streams streams;
     init_gvec_to_xy(&params, &streams,
@@ -905,12 +848,17 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
             CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
             CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
             CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result));
-            size_t local_work_size = 16;
-            size_t total_work_size = chunk_ngvec * chunk_npos;
-            total_work_size = local_work_size*(1 + (total_work_size-1)/local_work_size);
+            const size_t WS_NGVEC = 16;
+            const size_t WS_NPOS = 16;
 
-            clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &total_work_size,
-                                   &local_work_size, 0, NULL, NULL);
+            size_t local_work_size[] = { WS_NGVEC, WS_NPOS };
+            size_t total_work_size[] = {
+                next_multiple(chunk_ngvec, WS_NGVEC),
+                next_multiple(chunk_npos, WS_NPOS)
+            };
+
+            clEnqueueNDRangeKernel(queue, kernel, 2, NULL, total_work_size,
+                                   local_work_size, 0, NULL, NULL);
             clFinish(queue);
         }
         /* 3. wait and copy results */
@@ -935,7 +883,7 @@ python_cl_gvec_to_xy(PyObject *self, PyObject *args, PyObject *kwargs)
     static const char *kwlist[] = {"gvec_c", "rmat_d", "rmat_s", "rmat_c", "tvec_d",
         "tvec_s", "tvec_c", "beam_vec", "single_precision", nullptr};
     const char* parse_tuple_fmt = "O&O&O&O&O&O&O&|O&p";
-        
+
     named_array na_gVec_c = {kwlist[0], na_vector3, na_0d_or_1d, nullptr};
     named_array na_rMat_d = {kwlist[1], na_matrix33, na_0d_only, nullptr};
     named_array na_rMat_s = {kwlist[2], na_matrix33, na_0d_or_1d, nullptr};
@@ -1025,7 +973,7 @@ python_cl_gvec_to_xy(PyObject *self, PyObject *args, PyObject *kwargs)
                        na_tVec_d.pyarray, na_tVec_s.pyarray, na_tVec_c.pyarray,
                        na_beam_vec.pyarray,
                        result_array);
-        
+
         if (err)
         {
             PyErr_Format(PyExc_RuntimeError, "Failed to run the kernel. OCL error?");
@@ -1036,6 +984,6 @@ python_cl_gvec_to_xy(PyObject *self, PyObject *args, PyObject *kwargs)
     return reinterpret_cast<PyObject*>(result_array);
  fail:
     Py_XDECREF((PyObject*) result_array);
-    
+
     return NULL;
 }
