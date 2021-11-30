@@ -19,10 +19,22 @@ public:
     static cl_instance *instance();
     static void shutdown();
 
-    // this are kept as public, as there is no point on hiding handles
+
+    // some helpers to get important data
+    size_t device_max_alloc_size() const;
+    size_t device_global_mem_size() const;
+    size_t device_max_compute_units() const;
+    bool   device_host_unified_memory() const;
+    bool   device_compiler_available() const;
+    
+    //
+    size_t kernel_preferred_workgroup_size_multiple(cl_kernel kernel) const;
+    // this are kept as public, as there is no point on hiding handles and
+    // not everything is hidden.
     cl_device_id device;
     cl_context context;
     cl_command_queue queue;
+
 private:
     bool init();
     cl_instance();

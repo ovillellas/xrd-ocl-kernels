@@ -2,14 +2,144 @@
 #include "utils.hpp"
 #include "dev_help.hpp"
 
-#include <algorithm> // std::max
+#include <algorithm> // std::max, std::min
 
-#define CLXF_PREFERRED_SLICE_SIZE (4*1024*1024)
+#define CLXF_PREFERRED_SLICE_SIZE ((size_t)4*1024*1024)
+
+// Maximum result size. But will constraint also to 1/4 of device memory in
+// any case.
+#define CLXF_MAX_RESULT_SIZE ((size_t)512*1024*1024)
+
+// maximum number of npos per thread. In a workgroup X will be handled.
+#define CLXF_MAX_NPOS_PER_THREAD ((size_t)128)
+#define CLXF_MAX_NGVEC_PER_CHUNK ((size_t)512)
+
+/*
+ * When executing gvec_to_xy as an OpenCL kernel, there are several sizes to
+ * deal with:
+ *
+ * 1. total_size: this is the size of the dataset. That is, the parameters
+ *    received from the entry function. That is, a number for G vectors and
+ *    candidate positions to be projected into the detector.
+ *
+ * 2. chunk_size: As evaluation takes place in a device with potentially limited
+ *    memory size, total_size will be split in 'chunks'. All chunks are to be
+ *    processed one after another, each one resulting into an EnqueueNDRangeKernel
+ *    call. Results are moved into the result array in host memory.
+ *    If done properly, execution of one chunk may be overlappef with memory
+ *    copying from another chunk.
+ *
+ * 3. workgroup_chunk_size: In OpenCL, kernels are executed in workgroups.
+ *    A workgroup is a set of threads executing in lockstep. Instead of limiting
+ *    each thread to a single (gvec, npos) pair, work is split in a workgroup
+ *    basis. Each thread knows what part of its workgroup dataset evaluate.
+ *
+ * 4. kernel_local_size: This is how the kernel splits the chunk_size between
+ *    the different compute units. It is basically how it assigns blocks to
+ *    different workgroups.
+ */
+
+struct ocl_g2xy_sizes
+{
+    size_t total_size[2];
+    size_t chunk_size[2];
+    size_t workgroup_chunk_size[2];
+    size_t kernel_local_size[2];
+};
+
+inline void
+compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
+                       size_t device_memory,
+                       size_t workgroup_preferred_size,
+                       size_t compute_units,
+                       size_t base_value_size)
+{
+    /* criteria for the chunk_size:
+       The idea is having each compute unit working on the different "npos" of
+       an ngvec (this is due how the kernel executes).
+       So in an ideal world, the chunk size would have into account:
+       1. Total size of the results should be less than max result size.
+       2. its ngvecs is some multiple of the compute units.
+       3. its npos is as big as possible, but taking into account the previous
+          point.
+     */
+
+    // target_result_count is the target count of elements for the chunk. This
+    // is made so that it does not exceed the configured memory size nor 1/8th
+    // of the device memory.
+    const size_t target_result_count =
+        std::min(CLXF_MAX_RESULT_SIZE, device_memory/8)/(2*base_value_size);
+
+
+    // try the whole dataset, but respecting the configured max sizes per chunk
+    size_t max_npos_per_chunk = CLXF_MAX_NPOS_PER_THREAD*workgroup_preferred_size;
+    size_t chunk_ngvec = std::min(ngvec, (size_t)CLXF_MAX_NGVEC_PER_CHUNK);
+    size_t chunk_npos = std::min(npos, max_npos_per_chunk);
+    chunk_npos = next_multiple(chunk_npos, workgroup_preferred_size);
+
+    if (chunk_ngvec * chunk_npos > target_result_count)
+    {
+        // does not fit in the target result count...
+
+        // split by ngvec (kernel happens to deal well with many npos. As each
+        // workgroup works on a single gvec, Try to balance the number of gvecs
+        // per chunk with the number of compute units, so all compute unit has
+        // data to work with.
+        chunk_ngvec = target_result_count/chunk_npos;
+        chunk_ngvec = (chunk_ngvec/compute_units)*compute_units;
+        chunk_ngvec = std::max(chunk_ngvec, std::min(ngvec, compute_units));
+
+        if (chunk_ngvec*chunk_npos > target_result_count)
+        {
+            // still does not fit in the target result count...
+
+            // split by npos as well. Target a number of npos by chunk so that
+            // all threads in a workgroup will have the same amount of work.
+            chunk_npos = target_result_count/chunk_ngvec;
+            chunk_npos = (chunk_ngvec/workgroup_preferred_size)*workgroup_preferred_size;
+            chunk_npos = std::max(chunk_npos, std::min(npos, workgroup_preferred_size));
+
+            if (chunk_ngvec * chunk_npos > target_result_count)
+            {
+                // still does not fit in the budget...
+
+                // This is a last resort. Being here means that the memory budget
+                // is very low. Go for the safest, although it would be very
+                // slow. Execute element by element.
+                chunk_npos = 1; chunk_ngvec = 1;
+            }
+        }
+    }
+
+    /*
+       in general, workgroup_chunk should be a multiple of kernel_local to
+       take maximum advantage of all computing threads. The kernel_local_npos
+       is configured to split the npos along the workgroup, using the preferred
+       size.
+
+       workgroup_chunk will evenly divide the npos in the chunk among the
+       different threads.
+    */
+    size_t kernel_local_ngvec = 1;
+    size_t kernel_local_npos = workgroup_preferred_size;
+    size_t workgroup_chunk_ngvec = 1;
+    size_t workgroup_chunk_npos = chunk_npos;
+    sizes.total_size[0] = ngvec;
+    sizes.total_size[1] = npos;
+    sizes.chunk_size[0] = chunk_ngvec;
+    sizes.chunk_size[1] = chunk_npos;
+    sizes.workgroup_chunk_size[0] = workgroup_chunk_ngvec;
+    sizes.workgroup_chunk_size[1] = workgroup_chunk_npos;
+    sizes.kernel_local_size[0] = kernel_local_ngvec;
+    sizes.kernel_local_size[1] = kernel_local_npos;
+}
 
 // parameters for use in gvec_to_xy. Templatized to support both, float and
 // double versions.
 template <typename REAL>
-struct gvec_to_xy_params {
+struct g2xy_params
+{
+    cl_uint workgroup_chunk_size[2];
     cl_uint chunk_size[2];
     cl_uint total_size[2];
     REAL gVec_c[3];
@@ -24,14 +154,11 @@ struct gvec_to_xy_params {
 };
 
 
-// streams used in gvec_to_xy. Some arguments may be streamed, so they will
-// have a stream represented. It is not templatized, as the streams will be
-// converted in a chunk basis for execution. This is to avoid
-// creating/maintaining a full size copy of possibly huge arrays.
-//
-// A disabled stream is marked by a NULL in its base address, but the canonical
-// way to set the stream as non-used is to zap it with zeroes.
-struct gvec_to_xy_streams {
+// host information for gvec_to_xy. This includes the streams to be able to
+// stream in/out the data to/from the device. But also information about
+// orchestrating the execution to maximize efficiency.
+struct g2xy_host_info {
+    size_t kernel_local_size[2];
     stream_desc gVec_c_stream;
     stream_desc rMat_s_stream;
     stream_desc tVec_c_stream;
@@ -40,27 +167,29 @@ struct gvec_to_xy_streams {
 
 template <typename REAL>
 static inline int
-init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
-                gvec_to_xy_streams * restrict streams,
-                PyArrayObject *pa_gVec_c,
-                PyArrayObject *pa_rMat_d,
-                PyArrayObject *pa_rMat_s,
-                PyArrayObject *pa_rMat_c,
-                PyArrayObject *pa_tVec_d,
-                PyArrayObject *pa_tVec_s,
-                PyArrayObject *pa_tVec_c,
-                PyArrayObject *pa_beam_vec,
-                PyArrayObject *pa_result_xy)
-{
+init_g2xy(g2xy_params<REAL> * restrict params,
+          g2xy_host_info * restrict host_info,
+          const cl_instance *cl,
+          cl_kernel kernel,
+          PyArrayObject *pa_gVec_c,
+          PyArrayObject *pa_rMat_d,
+          PyArrayObject *pa_rMat_s,
+          PyArrayObject *pa_rMat_c,
+          PyArrayObject *pa_tVec_d,
+          PyArrayObject *pa_tVec_s,
+          PyArrayObject *pa_tVec_c,
+          PyArrayObject *pa_beam_vec,
+          PyArrayObject *pa_result_xy)
+{ TIME_SCOPE("init_g2xy");
     if (!is_streaming_vector3(pa_gVec_c))
     {
         array_vector3_autoconvert<REAL>(params->gVec_c, pa_gVec_c);
-        zap_to_zero(streams->gVec_c_stream);
+        zap_to_zero(host_info->gVec_c_stream);
     }
     else
     {
         zap_to_zero(params->gVec_c);
-        array_stream_convert(&streams->gVec_c_stream, pa_gVec_c, 1, 1);
+        array_stream_convert(&host_info->gVec_c_stream, pa_gVec_c, 1, 1);
     }
 
     array_matrix33_autoconvert<REAL>(params->rMat_d, pa_rMat_d);
@@ -68,12 +197,12 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
     if (!is_streaming_matrix33(pa_rMat_s))
     {
         array_matrix33_autoconvert<REAL>(params->rMat_s, pa_rMat_s);
-        zap_to_zero(streams->rMat_s_stream);
+        zap_to_zero(host_info->rMat_s_stream);
     }
     else
     {
         zap_to_zero(params->rMat_s);
-        array_stream_convert(&streams->rMat_s_stream, pa_rMat_s, 2, 1);
+        array_stream_convert(&host_info->rMat_s_stream, pa_rMat_s, 2, 1);
     }
 
     array_matrix33_autoconvert<REAL>(params->rMat_c, pa_rMat_c);
@@ -83,12 +212,12 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
     if (!is_streaming_vector3(pa_tVec_c))
     {
         array_vector3_autoconvert<REAL>(params->tVec_c, pa_tVec_c);
-        zap_to_zero(streams->tVec_c_stream);
+        zap_to_zero(host_info->tVec_c_stream);
     }
     else
     {
         zap_to_zero(params->tVec_c);
-        array_stream_convert(&streams->tVec_c_stream, pa_tVec_c, 1, 1);
+        array_stream_convert(&host_info->tVec_c_stream, pa_tVec_c, 1, 1);
     }
 
     if (pa_beam_vec)
@@ -102,25 +231,39 @@ init_gvec_to_xy(gvec_to_xy_params<REAL> * restrict params,
         params->has_beam = 0;
     }
 
-    array_stream_convert(&streams->xy_out_stream, pa_result_xy, 1, 2);
+    array_stream_convert(&host_info->xy_out_stream, pa_result_xy, 1, 2);
 
-    size_t ngvec = streams->xy_out_stream.stream_dims()[0];
-    size_t npos = streams->xy_out_stream.stream_dims()[1];
+    size_t ngvec = host_info->xy_out_stream.stream_dims()[0];
+    size_t npos = host_info->xy_out_stream.stream_dims()[1];
 
-    params->chunk_size[0] = static_cast<cl_uint>(ngvec);
-    params->chunk_size[1] = static_cast<cl_uint>(npos);
-    params->total_size[0] = static_cast<cl_uint>(ngvec);
-    params->total_size[1] = static_cast<cl_uint>(npos);
+    // let compute_ocl_g2xy_sizes apply heuristics for best chunk size meeting
+    // constraints.
+    ocl_g2xy_sizes sizes;
+    compute_ocl_g2xy_sizes(sizes, ngvec, npos,
+                           cl->device_global_mem_size(),
+                           cl->kernel_preferred_workgroup_size_multiple(kernel),
+                           cl->device_max_compute_units(),
+                           sizeof(REAL));
+
+
+    params->workgroup_chunk_size[0] = static_cast<cl_uint>(sizes.workgroup_chunk_size[0]);
+    params->workgroup_chunk_size[1] = static_cast<cl_uint>(sizes.workgroup_chunk_size[1]);
+    params->chunk_size[0] = static_cast<cl_uint>(sizes.chunk_size[0]);
+    params->chunk_size[1] = static_cast<cl_uint>(sizes.chunk_size[1]);
+    params->total_size[0] = static_cast<cl_uint>(sizes.total_size[0]);
+    params->total_size[1] = static_cast<cl_uint>(sizes.total_size[1]);
+    host_info->kernel_local_size[0] = sizes.kernel_local_size[0];
+    host_info->kernel_local_size[1] = sizes.kernel_local_size[1];
 
     return 0;
 }
 
 template <typename REAL>
 static void
-print_gvec_to_xy(const gvec_to_xy_params<REAL> *params,
-                 const gvec_to_xy_streams *streams)
+print_g2xy(const g2xy_params<REAL> *params,
+                 const g2xy_host_info *host_info)
 {
-    printf("gvec_to_xy_params\nkind: %s\n", floating_kind_name<REAL>());
+    printf("g2xy_params\nkind: %s\n", floating_kind_name<REAL>());
     printf("chunk_size: (%u, %u)\n", params->chunk_size[0], params->chunk_size[1]);
     printf("total_size: (%u, %u)\n", params->total_size[0], params->total_size[1]);
     print_vector3("gVec_c", params->gVec_c);
@@ -133,25 +276,26 @@ print_gvec_to_xy(const gvec_to_xy_params<REAL> *params,
     print_vector3("beam", params->beam);
     printf("has_beam: %s\n", params->has_beam?"True":"False");
 
-    print_stream("gVec_c", streams->gVec_c_stream);
-    print_stream("rMat_s", streams->rMat_s_stream);
-    print_stream("tVec_c", streams->tVec_c_stream);
-    print_stream("xy_out", streams->xy_out_stream);
+    print_stream("gVec_c", host_info->gVec_c_stream);
+    print_stream("rMat_s", host_info->rMat_s_stream);
+    print_stream("tVec_c", host_info->tVec_c_stream);
+    print_stream("xy_out", host_info->xy_out_stream);
 }
 
 struct g2xy_buffs
 {
-    cl_mem params;  // the problem "params"
-    cl_mem gvec_c;  // gpu buffer for gvectors
-    cl_mem rmat_s;  // gpu buffer for rmat_s
-    cl_mem tvec_c;  // gpu buffer for tvec_c
-    cl_mem xy_result;  // gpu buffer for xy_result
+    cl_mem params;        // the problem "params"
+    cl_mem gvec_c;        // gpu buffer for gvectors
+    cl_mem rmat_s;        // gpu buffer for rmat_s
+    cl_mem tvec_c;        // gpu buffer for tvec_c
+    cl_mem xy_result[2];  // gpu buffers for xy_result (double buffered)
 };
 
 static void
 release_g2xy_buffs(g2xy_buffs *buffs)
 {
-    CL_LOG_CHECK(clReleaseMemObject(buffs->xy_result));
+    CL_LOG_CHECK(clReleaseMemObject(buffs->xy_result[1]));
+    CL_LOG_CHECK(clReleaseMemObject(buffs->xy_result[0]));
     CL_LOG_CHECK(clReleaseMemObject(buffs->tvec_c));
     CL_LOG_CHECK(clReleaseMemObject(buffs->rmat_s));
     CL_LOG_CHECK(clReleaseMemObject(buffs->gvec_c));
@@ -161,20 +305,20 @@ release_g2xy_buffs(g2xy_buffs *buffs)
 }
 
 template<typename REAL>
-cl_instance::kernel_slot gvec_to_xy_kernel()
+cl_instance::kernel_slot g2xy_kernel()
 {
     static_assert(sizeof(REAL) == 0, "Unsupported type for gvec_to_xy");
     return cl_instance::kernel_slot::invalid;
 }
 
 template<>
-cl_instance::kernel_slot gvec_to_xy_kernel<float>()
+cl_instance::kernel_slot g2xy_kernel<float>()
 {
     return cl_instance::kernel_slot::gvec_to_xy_f32;
 }
 
 template<>
-cl_instance::kernel_slot gvec_to_xy_kernel<double>()
+cl_instance::kernel_slot g2xy_kernel<double>()
 {
     return cl_instance::kernel_slot::gvec_to_xy_f64;
 }
@@ -195,7 +339,8 @@ static const char *g2xy_source = R"CLC(
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
 
-struct __attribute__((packed)) gvec_to_xy_params {
+struct __attribute__((packed)) g2xy_params {
+    uint workgroup_chunk_size[2];
     uint chunk_size[2];
     uint total_size[2];
     REAL gVec_c[3];
@@ -263,22 +408,26 @@ to_detector(REAL3 rD0, REAL3 rD1, REAL3 rD2, REAL3 tD,
 }
 
 __kernel void gvec_to_xy(
-    __constant const struct gvec_to_xy_params *params,
+    __constant const struct g2xy_params *params,
     __global const REAL *g_gVec_c,
     __global const REAL *g_rMat_s,
     __global const REAL *g_tVec_c,
     __global REAL * restrict g_xy_result)
 {
     size_t gvec_idx = get_global_id(0);
-    size_t pos_idx = get_global_id(1);
-    uint ngvec = params->chunk_size[0];
-    uint npos = params->chunk_size[1];
-
-    /* handle border case */
-    if (gvec_idx >= ngvec || pos_idx >= npos)
+    size_t pos_group_idx = get_group_id(1);
+    size_t local_size = get_local_size(1); // limited to npos dimension
+    size_t local_idx  = get_local_id(1); // limited to npos dimension
+    size_t pos_offset = get_global_offset(1);
+    size_t gvec_offset = get_global_offset(0);
+    size_t ngvec = params->total_size[0] - gvec_offset;
+    size_t npos = params->total_size[1] - pos_offset;
+    size_t workgroup_npos = params->workgroup_chunk_size[1];
+    size_t result_npos = min(workgroup_npos, npos);
+    // this should only kick-in in partial chunks
+    if (gvec_idx >= ngvec)
         return;
 
-    REAL3 tVec_c = vload3(pos_idx, g_tVec_c);
     REAL3 gVec_c = vload3(gvec_idx, g_gVec_c);
     REAL3 rMat_s0, rMat_s1, rMat_s2;
     REAL3 rMat_c0 = vload3(0, params->rMat_c),
@@ -303,8 +452,6 @@ __kernel void gvec_to_xy(
         rMat_s1 = vload3(1, params->rMat_s);
         rMat_s2 = vload3(2, params->rMat_s);
     }
-
-    REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
     REAL3 gVec_sam = rotate_vector(rMat_c0, rMat_c1, rMat_c2, gVec_c);
     REAL3 gVec_lab = rotate_vector(rMat_s0, rMat_s1, rMat_s2, gVec_sam);
     REAL3 ray_vector;
@@ -313,9 +460,18 @@ __kernel void gvec_to_xy(
     else
         ray_vector = diffract_z(gVec_lab);
 
-    REAL2 projected = to_detector(rMat_d0, rMat_d1, rMat_d2, tVec_d, ray_origin, ray_vector);
+    size_t pos_group_start = pos_offset; // + pos_group_idx*workgroup_npos;
+    size_t pos_end = pos_group_start + result_npos;
+    size_t pos_start = pos_group_start + local_idx;
 
-    vstore2(projected, gvec_idx*npos + pos_idx , g_xy_result);
+    for (size_t pos_idx = pos_start; pos_idx<pos_end; pos_idx+=local_size)
+    {
+        REAL3 tVec_c = vload3(pos_idx, g_tVec_c);
+
+        REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
+        REAL2 projected = to_detector(rMat_d0, rMat_d1, rMat_d2, tVec_d, ray_origin, ray_vector);
+        vstore2(projected, gvec_idx*result_npos + pos_idx, g_xy_result);
+    }
 }
 )CLC";
 
@@ -338,8 +494,8 @@ template<typename REAL>
 static bool
 init_g2xy_buffs(g2xy_buffs *return_state,
                 cl_context context,
-                const gvec_to_xy_params<REAL> *params,
-                const gvec_to_xy_streams *streams)
+                const g2xy_params<REAL> *params,
+                const g2xy_host_info *host_info)
 {
     TIME_SCOPE("init_g2xy_buffs");
     g2xy_buffs buffs;
@@ -365,9 +521,9 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     // It should be possible to double buffer copy-convert and execution so that
     // copy-convert time is overlapped with actual computation in the GPU.
 
-    if (streams->gVec_c_stream.is_active())
+    if (host_info->gVec_c_stream.is_active())
     {
-        size_t buff_size = 3*sizeof(REAL)*params->chunk_size[0];
+        size_t buff_size = 3*sizeof(REAL)*params->total_size[0];
         const cl_mem_flags buff_flags = CL_MEM_READ_ONLY |
                                         CL_MEM_HOST_WRITE_ONLY;
         buffs.gvec_c = clCreateBuffer(context, buff_flags, buff_size,
@@ -376,9 +532,9 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     else
         goto fail; // not supported yet.
 
-    if (streams->rMat_s_stream.is_active())
+    if (host_info->rMat_s_stream.is_active())
     {
-        size_t buff_size = 9*sizeof(REAL)*params->chunk_size[0];
+        size_t buff_size = 9*sizeof(REAL)*params->total_size[0];
         cl_mem_flags buff_flags = CL_MEM_READ_ONLY |
                                   CL_MEM_HOST_WRITE_ONLY;
         buffs.rmat_s = clCreateBuffer(context, buff_flags, buff_size,
@@ -387,9 +543,9 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     else
         goto fail; // not supported yet.
 
-    if (streams->tVec_c_stream.is_active())
+    if (host_info->tVec_c_stream.is_active())
     {
-        size_t buff_size = 3*sizeof(REAL)*params->chunk_size[1];
+        size_t buff_size = 3*sizeof(REAL)*params->total_size[1];
         cl_mem_flags buff_flags = CL_MEM_READ_ONLY |
                                   CL_MEM_HOST_WRITE_ONLY;
         buffs.tvec_c = clCreateBuffer(context, buff_flags, buff_size,
@@ -398,13 +554,15 @@ init_g2xy_buffs(g2xy_buffs *return_state,
     else
         goto fail;
 
-    if (streams->xy_out_stream.is_active())
+    if (host_info->xy_out_stream.is_active())
     {
         size_t buff_size = 2*sizeof(REAL)*params->chunk_size[0]*params->chunk_size[1];
         cl_mem_flags buff_flags = CL_MEM_WRITE_ONLY |
                                   CL_MEM_HOST_READ_ONLY;
-        buffs.xy_result = clCreateBuffer(context, buff_flags, buff_size,
-                                         NULL, NULL);
+        buffs.xy_result[0] = clCreateBuffer(context, buff_flags, buff_size,
+                                            NULL, NULL);
+        buffs.xy_result[1] = clCreateBuffer(context, buff_flags, buff_size,
+                                            NULL, NULL);
     }
     else
         goto fail;
@@ -472,34 +630,46 @@ next_element(size_t * restrict curr, const size_t *dims, size_t ndims)
 
 template<typename DST_REAL, typename SRC_REAL>
 static void
-copy_convert_chunk(void * restrict dst, const void *src,
+copy_convert_chunk(void * restrict dst, size_t dst_size_in_bytes,
+                   const void *src,
                    const size_t *dims, const ptrdiff_t *strides,
                    size_t ndim)
 {
-    //printf("Chunk in: %s <- %s.\n", type_to_cstr<DST_REAL>(), type_to_cstr<SRC_REAL>());
+    void *limit = byte_index(dst, dst_size_in_bytes);
+#if defined(CLXF_LOG_COPY_CONVERT) && CLXF_LOG_COPY_CONVERT
+    printf("copy_convert (begin): %p - %p(%s) <- %p(%s)\n",
+           dst, limit,
+           type_to_cstr<DST_REAL>(),
+           src, type_to_cstr<SRC_REAL>());
+    print_dims("\tdims", dims, ndim);
+    print_strides("\tstrides", strides, ndim);
+#endif
     DST_REAL * restrict out = static_cast<DST_REAL *>(dst);
     const SRC_REAL *in = static_cast<const SRC_REAL *>(src);
     size_t curr_pos[ndim];
     for (size_t i = 0; i<ndim; i++)
         curr_pos[i] = 0;
 
-    size_t count = 0;
     do {
+        if (out > limit)
+        {
+            printf("BAD-BAD-BAD: will write past limit (%p)\n", limit);
+            print_dims("\t\tdims", curr_pos, ndim);
+            printf("\t\t\tinto %p (%p) offset = %zd\n", out, dst, out - static_cast<DST_REAL*>(dst));
+        }
         *out++ = *ndim_index(in, curr_pos, strides, ndim);
-        count ++;
     } while(next_element(curr_pos, dims, ndim));
 #if defined(CLXF_LOG_COPY_CONVERT) && CLXF_LOG_COPY_CONVERT
-    print_dims("chunk dimensions", dims, ndim);
-    printf("Chunk in: %zd %s written (%s original)\n", count,
-           type_to_cstr<DST_REAL>(), type_to_cstr<SRC_REAL>());
+    printf("\t%zd values copy-converted.\n", out - static_cast<DST_REAL*>(dst));
 #endif
 }
 
 
 template<typename DST_REAL, typename SRC_REAL>
 static void
-copy_convert_chunk_out(void * restrict dst, const void *src,
-                       const size_t *dims, const ptrdiff_t *strides,
+copy_convert_chunk_out(void * restrict dst,
+                       const void *src, const size_t *dims,
+                       const ptrdiff_t *strides,
                        size_t ndim)
 {
      // This is likely to write scattered, which is not ideal. Open for optimization
@@ -527,7 +697,7 @@ inline array_copy_convert_error
 copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
                        const stream_desc *stream, const size_t *pos,
                        const size_t *sz, size_t ndim)
-{
+{ TIME_SCOPE("copy_convert_to_buffer");
     array_copy_convert_error err = NO_ERROR;
     if (ndim != stream->stream_ndim())
         return DIM_ERROR;
@@ -555,17 +725,17 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
     const void *src = ndim_index(stream->base, pos, strides,
                                  stream->stream_ndim());
 
-    //printf("q: %p b: %p - WRITE_INVALIDATE - sz: %zd.\n", queue, buffer, total_size);
+    // printf("q: %p b: %p - WRITE_INVALIDATE - sz: %zd.\n", queue, buffer, total_size);
     void *dst = clEnqueueMapBuffer(queue, buffer, CL_TRUE,
                                    CL_MAP_WRITE_INVALIDATE_REGION,
                                    0, total_size, 0, NULL, NULL, NULL);
     switch(stream->base_type)
     {
     case NPY_FLOAT32:
-        copy_convert_chunk<REAL, float>(dst, src, dims, strides, total_ndim);
+        copy_convert_chunk<REAL, float>(dst, total_size, src, dims, strides, total_ndim);
         break;
     case NPY_FLOAT64:
-        copy_convert_chunk<REAL, double>(dst, src, dims, strides, total_ndim);
+        copy_convert_chunk<REAL, double>(dst, total_size, src, dims, strides, total_ndim);
         break;
     default:
         // this should not happen, should be caught at pre-condition
@@ -579,7 +749,8 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
 // perform a cl_buffer to main memory slicing to a max size so that DMA and
 // memcpy may be overlapped.
 static void
-sliced_buff_to_mem(cl_command_queue queue, cl_mem buffer, void *dst, size_t total_size, size_t slice_size)
+sliced_buff_to_mem(cl_command_queue queue, cl_mem buffer, void *dst,
+                   size_t total_size, size_t slice_size)
 {
     const size_t SLICE_SIZE = slice_size;
 
@@ -751,6 +922,96 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
 }
 
 template <typename REAL>
+static inline void
+execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
+                     g2xy_params<REAL>& params,
+                     g2xy_host_info& host_info,
+                     g2xy_buffs& buffs)
+{
+    /* when executing chunked... do it with different offsets and so... */
+    size_t curr_chunk[2] = {0};
+    size_t chunk_dims[2] = {
+        round_up_divide(params.total_size[0], params.chunk_size[0]),
+        round_up_divide(params.total_size[1], params.chunk_size[1])
+    };
+    int curr_buff = 0; //, next_buff = 1;
+
+    size_t chunk_size[2] = {params.chunk_size[0], params.chunk_size[1]};
+    size_t chunk_offset[2];
+    do
+    {
+        { TIME_SCOPE("cl_gvec_to_xy - launch kernel (chunked)");
+
+            /* enqueue next_kernel */
+            CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
+            CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
+            CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
+            CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
+            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),
+                                        &buffs.xy_result[curr_buff]));
+
+            chunk_offset[0] = curr_chunk[0]*params.chunk_size[0];
+            chunk_offset[1] = curr_chunk[1]*params.chunk_size[1];
+            CL_LOG_CHECK(clEnqueueNDRangeKernel(queue, kernel, 2,
+                                                chunk_offset, chunk_size,
+                                                host_info.kernel_local_size,
+                                                0, NULL,
+                                                NULL));
+            clFinish(queue);
+        }
+
+        { TIME_SCOPE("cl_gvec_to_xy - copy results (chunked)");
+            size_t this_chunk_size[2] = {
+                std::min(chunk_size[0], params.total_size[0] - chunk_offset[0]),
+                std::min(chunk_size[1], params.total_size[1] - chunk_offset[1])
+            };
+            copy_convert_from_buffer<REAL>(queue, buffs.xy_result[0],
+                                           &host_info.xy_out_stream,
+                                           chunk_offset, this_chunk_size, 2);
+            clFinish(queue);
+        }
+
+    } while (next_element(curr_chunk, chunk_dims, 2));
+
+}
+
+template <typename REAL>
+static inline void
+execute_g2xy_oneshot(cl_command_queue queue, cl_kernel kernel,
+                     g2xy_params<REAL>& params,
+                     g2xy_host_info& host_info,
+                     g2xy_buffs &buffs)
+{
+    size_t chunk_offset[2] = {0, 0};
+    size_t chunk_size[2] = { params.total_size[0], params.total_size[1] };
+    /* prepare and enqueue the kernel */
+    { TIME_SCOPE("cl_gvec_to_xy - execute kernel (oneshot)");
+        CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
+        CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
+        CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
+        CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
+        CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result[0]));
+
+        // use chunk_size in this case, as it is properly rounded up.
+        size_t total_size[] = { params.chunk_size[0], params.chunk_size[1] };
+        clEnqueueNDRangeKernel(queue, kernel, 2, NULL, total_size,
+                               host_info.kernel_local_size, 0, NULL, NULL);
+        clFinish(queue);
+    }
+    /* wait and copy results */
+    { TIME_SCOPE("cl_gvec_to_xy - copy results (oneshot)");
+        size_t this_chunk_size[2] = {
+            std::min(chunk_size[0], params.total_size[0] - chunk_offset[0]),
+            std::min(chunk_size[1], params.total_size[1] - chunk_offset[1])
+        };
+        copy_convert_from_buffer<REAL>(queue, buffs.xy_result[0],
+                                       &host_info.xy_out_stream,
+                                       chunk_offset, this_chunk_size, 2);
+        clFinish(queue);
+    }
+}
+
+template <typename REAL>
 static int
 cl_gvec_to_xy(PyArrayObject *gVec_c,
               PyArrayObject *rMat_d, PyArrayObject *rMat_s, PyArrayObject *rMat_c,
@@ -766,82 +1027,63 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
     cl_context ctxt = cl->context;
     cl_command_queue queue = cl->queue;
 
-    cl_kernel kernel =  cl->get_kernel(gvec_to_xy_kernel<REAL>());
+    cl_kernel kernel =  cl->get_kernel(g2xy_kernel<REAL>());
     if (!kernel)
-    {
+    { TIME_SCOPE("compile kernel");
         /* kernel not cached... just build it */
         kernel = cl->build_kernel("gvec_to_xy", g2xy_source,
                                   kernel_compile_options<REAL>());
         if (kernel)
-            cl->set_kernel(gvec_to_xy_kernel<REAL>(), kernel);
+        {
+            cl->set_kernel(g2xy_kernel<REAL>(), kernel);
+        }
         else
             return -2;
     }
 
-    gvec_to_xy_params<REAL> params;
-    gvec_to_xy_streams streams;
-    init_gvec_to_xy(&params, &streams,
-                    gVec_c,
-                    rMat_d, rMat_s, rMat_c,
-                    tVec_d, tVec_s, tVec_c,
-                    beam_vec,
-                    result_xy_array);
+    g2xy_params<REAL> params;
+    g2xy_host_info host_info;
+    init_g2xy(&params, &host_info, cl, kernel,
+              gVec_c,
+              rMat_d, rMat_s, rMat_c,
+              tVec_d, tVec_s, tVec_c,
+              beam_vec,
+              result_xy_array);
 
     g2xy_buffs buffs;
-    if (init_g2xy_buffs(&buffs, ctxt, &params, &streams))
+    if (init_g2xy_buffs(&buffs, ctxt, &params, &host_info))
     {
-        size_t chunk_ngvec = static_cast<size_t>(params.chunk_size[0]);
-        size_t chunk_npos = static_cast<size_t>(params.chunk_size[1]);
-        size_t chunk_size[] = { chunk_ngvec, chunk_npos };
-        size_t chunk_offset[] = { 0, 0 };
-        /* initial implementation that does all in one go */
-        /* 1. fill input buffers */
-        /* TODO: copy convert should go here... now just raw copy */
+        size_t ngvec = static_cast<size_t>(params.total_size[0]);
+        size_t npos = static_cast<size_t>(params.total_size[1]);
+        size_t zero = 0;
+        /* Right now, all inputs are assumed to fit into device memory */
         { TIME_SCOPE("cl_gvec_to_xy - copy args");
             copy_convert_to_buffer<REAL>(queue, buffs.gvec_c,
-                                         &streams.gVec_c_stream,
-                                         chunk_offset, &chunk_ngvec, 1);
+                                         &host_info.gVec_c_stream,
+                                         &zero, &ngvec, 1);
             copy_convert_to_buffer<REAL>(queue, buffs.rmat_s,
-                                         &streams.rMat_s_stream,
-                                         chunk_offset, &chunk_ngvec, 1);
+                                         &host_info.rMat_s_stream,
+                                         &zero, &ngvec, 1);
             copy_convert_to_buffer<REAL>(queue, buffs.tvec_c,
-                                         &streams.tVec_c_stream,
-                                         chunk_offset+1, &chunk_npos, 1);
+                                         &host_info.tVec_c_stream,
+                                         &zero, &npos, 1);
 
             clFinish(queue);
         }
-        /* 2. prepare and enqueue the kernel */
-        { TIME_SCOPE("cl_gvec_to_xy - execute kernel");
-            CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result));
-            const size_t WS_NGVEC = 16;
-            const size_t WS_NPOS = 16;
 
-            size_t local_work_size[] = { WS_NGVEC, WS_NPOS };
-            size_t total_work_size[] = {
-                next_multiple(chunk_ngvec, WS_NGVEC),
-                next_multiple(chunk_npos, WS_NPOS)
-            };
-
-            clEnqueueNDRangeKernel(queue, kernel, 2, NULL, total_work_size,
-                                   local_work_size, 0, NULL, NULL);
-            clFinish(queue);
+        if (params.chunk_size[0] <= params.total_size[0] ||
+            params.chunk_size[1] <= params.total_size[1])
+        {
+            execute_g2xy_chunked(queue, kernel, params, host_info, buffs);
         }
-        /* 3. wait and copy results */
-        { TIME_SCOPE("cl_gvec_to_xy - copy results");
-            copy_convert_from_buffer<REAL>(queue, buffs.xy_result,
-                                           &streams.xy_out_stream,
-                                           chunk_offset, chunk_size, 2);
-            clFinish(queue);
+        else
+        {
+            execute_g2xy_oneshot(queue, kernel, params, host_info, buffs);
         }
 
         release_g2xy_buffs(&buffs);
     }
 
-    //print_gvec_to_xy(&params, &streams);
     return 0;
 }
 

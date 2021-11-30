@@ -6,7 +6,8 @@
 // CLXF_LOG_COPY_CONVERT - LOGs related to copy_conversion of matrices
 // CLXF_CL_LOG_LEVEL - LOG level of several opencl routines
 //                     (0 - no log; 1 - on failure; 2 - always)
-// CLXF_CL_LOG_TIMINGS - LOG timing information
+// CLXF_CL_LOG_KERNEL_INFO - LOG kernel info after successful build
+// CLXF_LOG_TIMINGS - LOG timing information
 // CLXF_ENABLE_TRACES - Enable output from TRACE macro
 #if not defined(CLXF_LOG_COPY_CONVERT)
 #  define CLXF_LOG_COPY_CONVERT 0
@@ -16,8 +17,12 @@
 #  define CLXF_CL_LOG_LEVEL 0
 #endif
 
-#if not defined(CLXF_CL_LOG_TIMINGS)
-#  define CLXF_CL_LOG_TIMINGS 0
+#if not defined(CLXF_CL_LOG_KERNEL_INFO)
+#  define CLXF_CL_LOG_KERNEL_INFO 0
+#endif
+
+#if not defined(CLXF_LOG_TIMINGS)
+#  define CLXF_LOG_TIMINGS 0
 #endif
 
 #if not defined(CLXF_ENABLE_TRACES)
@@ -26,7 +31,7 @@
 
 // -----------------------------------------------------------------------------
 
-#if defined(CLXF_CL_LOG_TIMINGS) && CLXF_CL_LOG_TIMINGS
+#if defined(CLXF_LOG_TIMINGS) && CLXF_LOG_TIMINGS
 #include <chrono>
 
 class scope_timer
@@ -81,6 +86,9 @@ private:
                          cl_error_to_str(cl_log_check_err), #code);     \
           } while(0)
 #endif
+
+#define CL_LOG_FAIL(...) CL_LOG(1, __VA_ARGS__)
+#define CL_LOG_SUCCESS(...) CL_LOG(2, __VA_ARGS__)
 
 #if defined(CLXF_CL_LOG_LEVEL) && 0 != CLXF_CL_LOG_LEVEL
 

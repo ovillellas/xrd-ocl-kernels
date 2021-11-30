@@ -12,12 +12,20 @@ zap_to_zero(T& to_zap)
     memset(&to_zap, 0, sizeof(to_zap));
 }
 
-template <typename T>
+template <typename T, typename T2>
 static inline T
-next_multiple(T base, T multiple)
+round_up_divide(T base, T2 divisor)
 {
     static_assert(std::is_integral<T>::value, "only for integral types");
-    return multiple*(1+(base-1)/multiple);
+    static_assert(std::is_integral<T2>::value, "only for integral types");
+    return 1+(base-1)/divisor;
+}
+
+template <typename T, typename T2>
+static inline T
+next_multiple(T base, T2 multiple)
+{
+    return multiple*round_up_divide(base, multiple);
 }
 
 // byte_index will offset the base pointer by 'offset' in bytes. This maps
@@ -160,18 +168,6 @@ numpy_type<double>()
     return NPY_FLOAT64;
 }
 
-static inline const char *
-numpy_type_to_str(int type)
-{
-    switch(type) {
-    case NPY_FLOAT32:
-        return "single precision float";
-    case NPY_FLOAT64:
-        return "double precision float";
-    default:
-        return "unsupported numpy type";
-    };
-}
 
 enum array_copy_convert_error {
     NO_ERROR = 0,
@@ -328,6 +324,20 @@ floating_kind_name<double>()
     return "float64";
 }
 
+static inline const char *
+numpy_type_to_str(int type)
+{
+    switch(type) {
+    case NPY_FLOAT32:
+        return floating_kind_name<float>();
+    case NPY_FLOAT64:
+        return floating_kind_name<float>();
+    default:
+        return "unsupported numpy type";
+    };
+}
+
+
 template <typename REAL>
 static inline void
 print_vector3(const char *name, const REAL *val)
@@ -469,9 +479,26 @@ print_dims(const char *name, const size_t *dims, size_t ndim)
     }
     else
     {
-        printf("%s: [ %zd", name, dims[0]);
+        printf("%s: [ %zu", name, dims[0]);
         for (size_t i=1; i<ndim; i++)
-            printf(", %zd", dims[i]);
+            printf(", %zu", dims[i]);
+        printf(" ]\n");
+    }
+}
+
+
+static inline void
+print_strides(const char *name, const ptrdiff_t *strides, size_t ndim)
+{
+    if (0 == ndim)
+    {
+        printf("%s: no dimensions\n", name);
+    }
+    else
+    {
+        printf("%s: [ %zd", name, strides[0]);
+        for (size_t i=1; i<ndim; i++)
+            printf(", %zd", strides[i]);
         printf(" ]\n");
     }
 }
