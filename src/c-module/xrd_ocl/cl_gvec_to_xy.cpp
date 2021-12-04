@@ -7,7 +7,7 @@
 
 // Maximum result size. But will constraint also to 1/4 of device memory in
 // any case.
-#define CLXF_MAX_RESULT_SIZE ((size_t)512*1024*1024)
+#define CLXF_MAX_RESULT_SIZE ((size_t)64*1024*1024)
 
 // maximum number of npos per thread. In a workgroup X will be handled.
 #define CLXF_MAX_WORKGROUP_WIDTH ((size_t)SIZE_MAX)
@@ -1125,43 +1125,6 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
 }
 
 template <typename REAL>
-static inline void
-execute_g2xy_oneshot(cl_command_queue queue, cl_kernel kernel,
-                     cl_mem_transfer_context& ctx,
-                     g2xy_params<REAL>& params,
-                     g2xy_host_info& host_info,
-                     g2xy_buffs &buffs)
-{
-    size_t chunk_offset[2] = {0, 0};
-    size_t chunk_size[2] = { params.total_size[0], params.total_size[1] };
-    /* prepare and enqueue the kernel */
-    { TIME_SCOPE("cl_gvec_to_xy - execute kernel (oneshot)");
-        CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
-        CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
-        CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
-        CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
-        CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result[0]));
-
-        // use chunk_size in this case, as it is properly rounded up.
-        size_t total_size[] = { params.chunk_size[0], params.chunk_size[1] };
-        clEnqueueNDRangeKernel(queue, kernel, 2, NULL, total_size,
-                               host_info.kernel_local_size, 0, NULL, NULL);
-        clFinish(queue);
-    }
-    /* wait and copy results */
-    { TIME_SCOPE("cl_gvec_to_xy - copy results (oneshot)");
-        size_t this_chunk_size[2] = {
-            std::min(chunk_size[0], params.total_size[0] - chunk_offset[0]),
-            std::min(chunk_size[1], params.total_size[1] - chunk_offset[1])
-        };
-        copy_convert_from_buffer<REAL>(ctx, buffs.xy_result[0],
-                                       &host_info.xy_out_stream,
-                                       chunk_offset, this_chunk_size, 2);
-        clFinish(ctx.queue);
-    }
-}
-
-template <typename REAL>
 static int
 cl_gvec_to_xy(PyArrayObject *gVec_c,
               PyArrayObject *rMat_d, PyArrayObject *rMat_s, PyArrayObject *rMat_c,
@@ -1222,15 +1185,7 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
             clFinish(ctx.queue);
         }
 
-        //if (params.chunk_size[0] <= params.total_size[0] ||
-        //    params.chunk_size[1] <= params.total_size[1])
-        //{
         execute_g2xy_chunked(queue, kernel, ctx, params, host_info, buffs);
-        //}
-        //else
-        // {
-        //execute_g2xy_oneshot(queue, kernel, ctx, params, host_info, buffs);
-        //}
     }
     release_g2xy_buffs(&buffs);
 
