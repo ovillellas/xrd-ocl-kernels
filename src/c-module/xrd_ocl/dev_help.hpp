@@ -62,17 +62,20 @@ private:
 static inline void
 cl_log_event_profile(const char* name, cl_event event)
 {
+    cl_ulong time_queued;
     cl_ulong time_submit;
     cl_ulong time_start;
     cl_ulong time_end;
 
+    double factor = 1./1e+6;
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_QUEUED, sizeof(time_queued), &time_queued, NULL);
     clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_submit), &time_submit, NULL);
     clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
     clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
 
-    printf("TIMER (cl_event): %s: %6.3f ms (submit: %6.3f execute: %6.3f)\n",
-           name, (time_end-time_submit)/1e+6, (time_start-time_submit)/1e+6,
-           (time_end-time_start)/1e+6);
+    printf("TIMER (cl_event): %s: %6.3f ms (submit: %6.3f execute: %6.3f queued: %6.3f)\n",
+           name, (time_end-time_submit)*factor, (time_start-time_submit)*factor,
+           (time_end-time_start)*factor, (time_submit-time_queued)*factor);
 }
 
 #  define CL_LOG_EVENT_PROFILE(name, event) do { cl_log_event_profile(name, event); } while(0)

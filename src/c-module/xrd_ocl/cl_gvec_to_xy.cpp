@@ -938,6 +938,7 @@ sliced_buff_to_mem(cl_mem_transfer_context& ctx, cl_mem buffer, void *dst,
                                              0, NULL, &pending[db_dma]));
             db_dma = 1 - db_dma;
             copied_dma += transfer_size;
+            clFlush(ctx.queue);
         }
         // at this point, wait for the dma associated with the current transfer
         // to finish and perform the memory copies
@@ -1103,6 +1104,7 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
                                                 host_info.kernel_local_size,
                                                 0, NULL,
                                                 &pending[db_compute]));
+            clFlush(queue);
             next_element(chunk_compute, chunk_dims, 2);
             db_compute = 1-db_compute;
             launched++;
