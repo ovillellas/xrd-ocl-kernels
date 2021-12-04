@@ -170,7 +170,11 @@ bool cl_instance::init()
 {
     TIME_SCOPE("cl_instance::init");
     cl_platform_id platform;
+    cl_command_queue_properties queue_properties = 0;
 
+#if defined(CLXF_LOG_TIMINGS) && CLXF_LOG_TIMINGS
+    queue_properties |= CL_QUEUE_PROFILING_ENABLE;
+#endif
     clGetPlatformIDs(1, &platform, NULL); // by default, the first platform
     clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL); // first GPU
 
@@ -180,11 +184,11 @@ bool cl_instance::init()
     }
 
     { TIME_SCOPE("Create CL command queue");
-        queue = clCreateCommandQueue(context, device, 0, NULL);
+        queue = clCreateCommandQueue(context, device, queue_properties, NULL);
     }
 
     { TIME_SCOPE("Create memory transfer channel");
-        mem_queue = clCreateCommandQueue(context, device, 0, NULL);
+        mem_queue = clCreateCommandQueue(context, device, queue_properties, NULL);
 
         staging_buffer = clCreateBuffer(context, CL_MEM_ALLOC_HOST_PTR,
                                         CLXF_STAGING_BUFFER_SIZE, NULL, NULL);

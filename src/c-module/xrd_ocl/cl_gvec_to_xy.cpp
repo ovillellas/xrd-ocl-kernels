@@ -11,7 +11,7 @@
 
 // maximum number of npos per thread. In a workgroup X will be handled.
 #define CLXF_MAX_WORKGROUP_WIDTH ((size_t)SIZE_MAX)
-#define CLXF_MAX_NPOS_PER_THREAD ((size_t)64)
+#define CLXF_MAX_NPOS_PER_THREAD ((size_t)128)
 #define CLXF_MAX_NPOS_PER_CHUNK  ((size_t)SIZE_MAX)
 #define CLXF_MAX_NGVEC_PER_CHUNK ((size_t)65536)
 
@@ -942,6 +942,7 @@ sliced_buff_to_mem(cl_mem_transfer_context& ctx, cl_mem buffer, void *dst,
         // at this point, wait for the dma associated with the current transfer
         // to finish and perform the memory copies
         CL_LOG_CHECK(clWaitForEvents(1, &pending[db_cpu]));
+        CL_LOG_EVENT_PROFILE("sliced_buff_to_mem copy buffer", pending[db_cpu]);
         CL_LOG_CHECK(clReleaseEvent(pending[db_cpu]));
         pending[db_cpu] = 0;
         void *src = buffer_ptr[db_cpu];
@@ -1059,7 +1060,6 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
                      g2xy_buffs& buffs)
 {
     /* when executing chunked... do it with different offsets and so... */
-    size_t curr_chunk[2] = {0};
     size_t chunk_dims[2] = {
         round_up_divide(params.total_size[0], params.chunk_size[0]),
         round_up_divide(params.total_size[1], params.chunk_size[1])
@@ -1080,47 +1080,60 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
     debug_print_array("tile_size", params.tile_size, 2, "%u");
     debug_print_array("local_size", host_info.kernel_local_size, 2, "%zu");
     #endif
-    size_t count = 0;
-    do
+
+    cl_event pending[2] ={ 0, 0};
+    int db_compute = 0, db_transfer = 0;
+    size_t launched = 0, transferred = 0, total = chunk_dims[0]*chunk_dims[1];
+    size_t chunk_compute[2] = {0};
+    size_t chunk_transfer[2] = {0};
+    CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
+    CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
+    CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
+    CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
+    while (transferred < total)
     {
-        { TIME_SCOPE("cl_gvec_to_xy - launch kernel (chunked)");
-
+        while (launched < total && !pending[db_compute])
+        { TIME_SCOPE("g2xy - enqueue kernel");
             /* enqueue next_kernel */
-            CL_LOG_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buffs.params));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result[0]));
 
-            //debug_print_dims("chunk", curr_chunk, 2);
-            //debug_print_dims("\tsize", work_size, 2);
+            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result[db_compute]));
+
             CL_LOG_CHECK(clEnqueueNDRangeKernel(queue, kernel, 2,
-                                                curr_chunk, work_size,
+                                                chunk_compute, work_size,
                                                 host_info.kernel_local_size,
                                                 0, NULL,
-                                                NULL));
-            clFinish(queue);
+                                                &pending[db_compute]));
+            next_element(chunk_compute, chunk_dims, 2);
+            db_compute = 1-db_compute;
+            launched++;
         }
 
-        { TIME_SCOPE("cl_gvec_to_xy - copy results (chunked)");
-            size_t chunk_offset[2] = {
-                curr_chunk[0]*params.chunk_size[0],
-                curr_chunk[1]*params.chunk_size[1]
-            };
-            size_t this_chunk_size[2] = {
-                std::min<size_t>(params.chunk_size[0], params.total_size[0] - chunk_offset[0]),
-                std::min<size_t>(params.chunk_size[1], params.total_size[1] - chunk_offset[1])
-            };
-            //debug_print_dims("chunk (mem)", curr_chunk, 2);
-            //debug_print_dims("\toffset", chunk_offset,2);
-            //debug_print_dims("\tsize", this_chunk_size, 2);
-            copy_convert_from_buffer<REAL>(ctx, buffs.xy_result[0],
+        { TIME_SCOPE("g2xy - wait for event");
+            CL_LOG_CHECK(clWaitForEvents(1, &pending[db_transfer]));
+            CL_LOG_EVENT_PROFILE("g2xy kernel exec", pending[db_transfer]);
+            CL_LOG_CHECK(clReleaseEvent(pending[db_transfer]));
+            pending[db_transfer] = 0;
+        }
+
+        TIME_SCOPE("g2xy - copy-convert");
+        size_t chunk_offset[2] = {
+            chunk_transfer[0]*params.chunk_size[0],
+            chunk_transfer[1]*params.chunk_size[1]
+        };
+        size_t this_chunk_size[2] = {
+            std::min<size_t>(params.chunk_size[0], params.total_size[0] - chunk_offset[0]),
+            std::min<size_t>(params.chunk_size[1], params.total_size[1] - chunk_offset[1])
+        };
+        //debug_print_dims("chunk (mem)", curr_chunk, 2);
+        //debug_print_dims("\toffset", chunk_offset,2);
+        //debug_print_dims("\tsize", this_chunk_size, 2);
+        copy_convert_from_buffer<REAL>(ctx, buffs.xy_result[db_transfer],
                                            &host_info.xy_out_stream,
                                            chunk_offset, this_chunk_size, 2);
-            clFinish(ctx.queue);
-        }
-        count++;
-    } while (next_element(curr_chunk, chunk_dims, 2));
+        db_transfer = 1-db_transfer;
+        transferred++;
+        next_element(chunk_transfer, chunk_dims, 2);
+    };
     //printf("%zd chunks run.\n", count);
 }
 

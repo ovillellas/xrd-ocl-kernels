@@ -58,8 +58,27 @@ private:
     clock::time_point start;
 };
 #  define TIME_SCOPE(name) scope_timer CONCAT(scptmr_,__LINE__)(name)
+
+static inline void
+cl_log_event_profile(const char* name, cl_event event)
+{
+    cl_ulong time_submit;
+    cl_ulong time_start;
+    cl_ulong time_end;
+
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_submit), &time_submit, NULL);
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+
+    printf("TIMER (cl_event): %s: %6.3f ms (submit: %6.3f execute: %6.3f)\n",
+           name, (time_end-time_submit)/1e+6, (time_start-time_submit)/1e+6,
+           (time_end-time_start)/1e+6);
+}
+
+#  define CL_LOG_EVENT_PROFILE(name, event) do { cl_log_event_profile(name, event); } while(0)
 #else
 #  define TIME_SCOPE(name) do {} while(0)
+#  define CL_LOG_EVENT_PROFILE(...) do {} while(0)
 #endif
 
 // -----------------------------------------------------------------------------
