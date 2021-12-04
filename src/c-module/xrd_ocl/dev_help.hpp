@@ -1,5 +1,7 @@
 #ifndef XRD_OCL_DEV_HELP_HPP
 #define XRD_OCL_DEV_HELP_HPP
+
+#include <stdio.h>
 // Configuration and declarations of development helper function
 // Use the following defines to configure different kinds of internal logging...
 //
@@ -29,6 +31,13 @@
 #  define CLXF_ENABLE_TRACES 0
 #endif
 
+
+#define _CONCAT(a,b) a ## b
+#define CONCAT(a,b) _CONCAT(a,b)
+#define _STR(a) # a
+#define STR(a) _STR(a)
+
+
 // -----------------------------------------------------------------------------
 
 #if defined(CLXF_LOG_TIMINGS) && CLXF_LOG_TIMINGS
@@ -48,7 +57,7 @@ private:
     const char *tag;
     clock::time_point start;
 };
-#  define TIME_SCOPE(name) scope_timer scptmr_##__LINE__(name)
+#  define TIME_SCOPE(name) scope_timer CONCAT(scptmr_,__LINE__)(name)
 #else
 #  define TIME_SCOPE(name) do {} while(0)
 #endif

@@ -35,6 +35,8 @@ public:
     cl_context context;
     cl_command_queue queue;
 
+    cl_command_queue mem_queue;
+    cl_mem staging_buffer;
 private:
     bool init();
     cl_instance();

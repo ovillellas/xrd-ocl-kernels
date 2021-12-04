@@ -3,16 +3,17 @@
 #include "dev_help.hpp"
 
 #include <algorithm> // std::max, std::min
-
-#define CLXF_PREFERRED_SLICE_SIZE ((size_t)4*1024*1024)
+#include <cstdint>
 
 // Maximum result size. But will constraint also to 1/4 of device memory in
 // any case.
 #define CLXF_MAX_RESULT_SIZE ((size_t)512*1024*1024)
 
 // maximum number of npos per thread. In a workgroup X will be handled.
-#define CLXF_MAX_NPOS_PER_THREAD ((size_t)128)
-#define CLXF_MAX_NGVEC_PER_CHUNK ((size_t)512)
+#define CLXF_MAX_WORKGROUP_WIDTH ((size_t)SIZE_MAX)
+#define CLXF_MAX_NPOS_PER_THREAD ((size_t)64)
+#define CLXF_MAX_NPOS_PER_CHUNK  ((size_t)SIZE_MAX)
+#define CLXF_MAX_NGVEC_PER_CHUNK ((size_t)65536)
 
 /*
  * When executing gvec_to_xy as an OpenCL kernel, there are several sizes to
@@ -29,10 +30,11 @@
  *    If done properly, execution of one chunk may be overlappef with memory
  *    copying from another chunk.
  *
- * 3. workgroup_chunk_size: In OpenCL, kernels are executed in workgroups.
+ * 3. tile_size: In OpenCL, kernels are executed in workgroups.
  *    A workgroup is a set of threads executing in lockstep. Instead of limiting
  *    each thread to a single (gvec, npos) pair, work is split in a workgroup
  *    basis. Each thread knows what part of its workgroup dataset evaluate.
+ *    TILE is the name I give to the block of data assigned to a workgroup.
  *
  * 4. kernel_local_size: This is how the kernel splits the chunk_size between
  *    the different compute units. It is basically how it assigns blocks to
@@ -43,9 +45,35 @@ struct ocl_g2xy_sizes
 {
     size_t total_size[2];
     size_t chunk_size[2];
-    size_t workgroup_chunk_size[2];
+    size_t tile_size[2];
     size_t kernel_local_size[2];
 };
+
+inline void
+hardcode_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
+                        size_t device_memory,
+                        size_t workgroup_preferred_size,
+                        size_t compute_units,
+                        size_t base_value_size,
+                        size_t chunk_ngvec, size_t chunk_npos)
+{
+    // just compute everything so that it can be evaluated with the hardcoded
+    // chunk size...
+    size_t kernel_local_ngvec = 1;
+    size_t kernel_local_npos = std::min(chunk_npos, workgroup_preferred_size);
+    size_t tile_ngvec = 1;
+    size_t tile_npos = chunk_npos;
+    
+    sizes.total_size[0] = ngvec;
+    sizes.total_size[1] = npos;
+    sizes.chunk_size[0] = chunk_ngvec;
+    sizes.chunk_size[1] = chunk_npos;
+    sizes.tile_size[0] = tile_ngvec;
+    sizes.tile_size[1] = tile_npos;
+    sizes.kernel_local_size[0] = kernel_local_ngvec;
+    sizes.kernel_local_size[1] = kernel_local_npos;
+}
+
 
 inline void
 compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
@@ -69,10 +97,12 @@ compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
     // of the device memory.
     const size_t target_result_count =
         std::min(CLXF_MAX_RESULT_SIZE, device_memory/8)/(2*base_value_size);
-
+    workgroup_preferred_size = std::min(workgroup_preferred_size,
+                                        CLXF_MAX_WORKGROUP_WIDTH);
 
     // try the whole dataset, but respecting the configured max sizes per chunk
-    size_t max_npos_per_chunk = CLXF_MAX_NPOS_PER_THREAD*workgroup_preferred_size;
+    size_t max_npos_per_workgroup = CLXF_MAX_NPOS_PER_THREAD*workgroup_preferred_size;
+    size_t max_npos_per_chunk = CLXF_MAX_NPOS_PER_CHUNK;//CLXF_MAX_NPOS_PER_THREAD*workgroup_preferred_size;
     size_t chunk_ngvec = std::min(ngvec, (size_t)CLXF_MAX_NGVEC_PER_CHUNK);
     size_t chunk_npos = std::min(npos, max_npos_per_chunk);
     chunk_npos = next_multiple(chunk_npos, workgroup_preferred_size);
@@ -87,7 +117,7 @@ compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
         // data to work with.
         chunk_ngvec = target_result_count/chunk_npos;
         chunk_ngvec = (chunk_ngvec/compute_units)*compute_units;
-        chunk_ngvec = std::max(chunk_ngvec, std::min(ngvec, compute_units));
+        // chunk_ngvec = std::max(chunk_ngvec, std::min(ngvec, compute_units));
 
         if (chunk_ngvec*chunk_npos > target_result_count)
         {
@@ -106,7 +136,7 @@ compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
                 // This is a last resort. Being here means that the memory budget
                 // is very low. Go for the safest, although it would be very
                 // slow. Execute element by element.
-                chunk_npos = 1; chunk_ngvec = 1;
+                chunk_npos = 1; chunk_ngvec = 1; workgroup_preferred_size = 1;
             }
         }
     }
@@ -122,16 +152,26 @@ compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
     */
     size_t kernel_local_ngvec = 1;
     size_t kernel_local_npos = workgroup_preferred_size;
-    size_t workgroup_chunk_ngvec = 1;
-    size_t workgroup_chunk_npos = chunk_npos;
+    size_t tile_ngvec = 1;
+    size_t tile_npos = std::min(chunk_npos, max_npos_per_workgroup);
+
     sizes.total_size[0] = ngvec;
     sizes.total_size[1] = npos;
     sizes.chunk_size[0] = chunk_ngvec;
     sizes.chunk_size[1] = chunk_npos;
-    sizes.workgroup_chunk_size[0] = workgroup_chunk_ngvec;
-    sizes.workgroup_chunk_size[1] = workgroup_chunk_npos;
+    sizes.tile_size[0] = tile_ngvec;
+    sizes.tile_size[1] = tile_npos;
     sizes.kernel_local_size[0] = kernel_local_ngvec;
     sizes.kernel_local_size[1] = kernel_local_npos;
+
+#if 0
+    printf("total size: (%zd, %zd) chunk_size: (%zd, %zd) "
+           "tile_size: (%zd, %zd) kernel_local_size: (%zd, %zd)\n",
+           sizes.total_size[0], sizes.total_size[1],
+           sizes.chunk_size[0], sizes.chunk_size[1],
+           sizes.tile_size[0], sizes.tile_size[1],
+           sizes.kernel_local_size[0], sizes.kernel_local_size[1]);
+#endif
 }
 
 // parameters for use in gvec_to_xy. Templatized to support both, float and
@@ -139,7 +179,7 @@ compute_ocl_g2xy_sizes(ocl_g2xy_sizes& sizes, size_t ngvec, size_t npos,
 template <typename REAL>
 struct g2xy_params
 {
-    cl_uint workgroup_chunk_size[2];
+    cl_uint tile_size[2];
     cl_uint chunk_size[2];
     cl_uint total_size[2];
     REAL gVec_c[3];
@@ -245,9 +285,16 @@ init_g2xy(g2xy_params<REAL> * restrict params,
                            cl->device_max_compute_units(),
                            sizeof(REAL));
 
-
-    params->workgroup_chunk_size[0] = static_cast<cl_uint>(sizes.workgroup_chunk_size[0]);
-    params->workgroup_chunk_size[1] = static_cast<cl_uint>(sizes.workgroup_chunk_size[1]);
+    /*
+    hardcode_ocl_g2xy_sizes(sizes, ngvec, npos,
+                            cl->device_global_mem_size(),
+                            cl->kernel_preferred_workgroup_size_multiple(kernel),
+                            cl->device_max_compute_units(),
+                            sizeof(REAL),
+                            4, 4);
+    */
+    params->tile_size[0] = static_cast<cl_uint>(sizes.tile_size[0]);
+    params->tile_size[1] = static_cast<cl_uint>(sizes.tile_size[1]);
     params->chunk_size[0] = static_cast<cl_uint>(sizes.chunk_size[0]);
     params->chunk_size[1] = static_cast<cl_uint>(sizes.chunk_size[1]);
     params->total_size[0] = static_cast<cl_uint>(sizes.total_size[0]);
@@ -329,18 +376,22 @@ static const char *g2xy_source = R"CLC(
 #  define REAL float
 #  define REAL2 float2
 #  define REAL3 float3
+#  define FMT "hlf"
 #else
 #  pragma OPENCL EXTENSION cl_khr_fp64: enable
 #  define REAL double
 #  define REAL2 double2
 #  define REAL3 double3
+#  define FMT "lf"
 #endif
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
 
+#define LOGS 0
+
 struct __attribute__((packed)) g2xy_params {
-    uint workgroup_chunk_size[2];
+    uint tile_size[2];
     uint chunk_size[2];
     uint total_size[2];
     REAL gVec_c[3];
@@ -412,65 +463,150 @@ __kernel void gvec_to_xy(
     __global const REAL *g_gVec_c,
     __global const REAL *g_rMat_s,
     __global const REAL *g_tVec_c,
-    __global REAL * restrict g_xy_result)
+    __global REAL * g_xy_result)
 {
-    size_t gvec_idx = get_global_id(0);
-    size_t pos_group_idx = get_group_id(1);
-    size_t local_size = get_local_size(1); // limited to npos dimension
-    size_t local_idx  = get_local_id(1); // limited to npos dimension
-    size_t pos_offset = get_global_offset(1);
-    size_t gvec_offset = get_global_offset(0);
-    size_t ngvec = params->total_size[0] - gvec_offset;
-    size_t npos = params->total_size[1] - pos_offset;
-    size_t workgroup_npos = params->workgroup_chunk_size[1];
-    size_t result_npos = min(workgroup_npos, npos);
-    // this should only kick-in in partial chunks
-    if (gvec_idx >= ngvec)
-        return;
+    /* 
+       Each thread executes a block of pt_ngvec x pt_npos (pt -> per_thread)
+       the way to infer that size is based on the local_size and the 
+       work_group_chunk_size.
+     */
 
-    REAL3 gVec_c = vload3(gvec_idx, g_gVec_c);
-    REAL3 rMat_s0, rMat_s1, rMat_s2;
-    REAL3 rMat_c0 = vload3(0, params->rMat_c),
-          rMat_c1 = vload3(1, params->rMat_c),
-          rMat_c2 = vload3(2, params->rMat_c);
-    REAL3 rMat_d0 = vload3(0, params->rMat_d),
-          rMat_d1 = vload3(1, params->rMat_d),
-          rMat_d2 = vload3(2, params->rMat_d);
-    REAL3 tVec_s = vload3(0, params->tVec_s);
-    REAL3 tVec_d = vload3(0, params->tVec_d);
-    REAL beam[3];
+    // local_size is the layout of the threads in the current workgroup, while
+    // local_id is the id for this thread within that layout.
+    // for now we are always using a (1, num_threads) layout.
+    uint2 local_size = (uint2)(get_local_size(0), get_local_size(1));
+    uint2 local_id = (uint2)(get_local_id(0), get_local_id(1));
+if (local_size.x != 1 || local_id.x != 0)
+    printf("unexpected local_size.x: %u local_id.x: %u", local_size.x, local_id.x);
+ 
 
-    if (g_rMat_s)
+    // the total size of the problem, in ngvec x npos
+    uint2 total_size = vload2(0, params->total_size);
+
+    // the size of the tile in ngvec x npos.
+    uint2 tile_size = vload2(0, params->tile_size);
+
+    // the offset for this kernel call, in chunks
+    uint2 chunk_size = vload2(0, params->chunk_size);
+    uint2 chunk_offset = (uint2)(get_global_offset(0), get_global_offset(1));
+    uint2 offset = chunk_offset*chunk_size; // the actual offset in ngvec, npos
+
+    // adjust size of the chunk to handle handle border cases
+    chunk_size = min(chunk_size, total_size - offset);
+
+    // the position for this workgroup, in tiles, relative to the whole problem
+    uint2 tile_pos = (uint2)(get_group_id(0), get_group_id(1));
+    uint2 pos = tile_pos*tile_size; // actual position within the chunk
+    uint2 global_pos = pos + offset;
+
+    // per-thread problem size, in ngvec x npos. ngvec should always result in 1
+    uint2 pt_size = tile_size / local_size;
+/*
+if (tile_size.x%pt_size.x != 0 || tile_size.y%pt_size.y != 0)
+    printf("unexpected pt_size (%u, %u) for local_size (%u, %u)\n",
+            pt_size.x, pt_size.y, local_size.x, local_size.y);
+*/
+#if 0
+printf("local_idx: %llu global_gvec_idx: %llu gvec_idx: %llu global_pos_idx: %llu\n"
+       "\ttotal_size: %ux%u\n"
+       "\tchunk_size: %ux%u\n"
+       "\ttile_size: %ux%u\n"
+       "\tworkgroup_pos: %llu->%llu\n",
+        local_idx, global_gvec_idx, gvec_offset, global_pos_idx,
+        total_size.x, total_size.y,
+        chunk_size.x, chunk_size.y,
+        tile_size.x, tile_size.y,
+        workgroup_pos_begin, workgroup_pos_end);
+#endif
+
+    // ignore gvecs past the range
+    if (pos.x < chunk_size.x)
     {
-        rMat_s0 = vload3((3*gvec_idx+0), g_rMat_s);
-        rMat_s1 = vload3((3*gvec_idx+1), g_rMat_s);
-        rMat_s2 = vload3((3*gvec_idx+2), g_rMat_s);
-    }
-    else
-    {
-        rMat_s0 = vload3(0, params->rMat_s);
-        rMat_s1 = vload3(1, params->rMat_s);
-        rMat_s2 = vload3(2, params->rMat_s);
-    }
-    REAL3 gVec_sam = rotate_vector(rMat_c0, rMat_c1, rMat_c2, gVec_c);
-    REAL3 gVec_lab = rotate_vector(rMat_s0, rMat_s1, rMat_s2, gVec_sam);
-    REAL3 ray_vector;
-    if (params->has_beam)
-        ray_vector = diffract(vload3(0, params->beam), gVec_lab);
-    else
-        ray_vector = diffract_z(gVec_lab);
+        REAL3 rMat_s0, rMat_s1, rMat_s2;
+        REAL3 rMat_c0 = vload3(0, params->rMat_c),
+              rMat_c1 = vload3(1, params->rMat_c),
+              rMat_c2 = vload3(2, params->rMat_c);
+        REAL3 rMat_d0 = vload3(0, params->rMat_d),
+              rMat_d1 = vload3(1, params->rMat_d),
+              rMat_d2 = vload3(2, params->rMat_d);
+        REAL3 tVec_s = vload3(0, params->tVec_s);
+        REAL3 tVec_d = vload3(0, params->tVec_d);
 
-    size_t pos_group_start = pos_offset; // + pos_group_idx*workgroup_npos;
-    size_t pos_end = pos_group_start + result_npos;
-    size_t pos_start = pos_group_start + local_idx;
+        REAL3 gVec_c = vload3(global_pos.x, g_gVec_c);
+        if (g_rMat_s)
+        {
+            rMat_s0 = vload3(3*global_pos.x+0, g_rMat_s);
+            rMat_s1 = vload3(3*global_pos.x+1, g_rMat_s);
+            rMat_s2 = vload3(3*global_pos.x+2, g_rMat_s);
+        }
+        else
+        {
+            rMat_s0 = vload3(0, params->rMat_s);
+            rMat_s1 = vload3(1, params->rMat_s);
+            rMat_s2 = vload3(2, params->rMat_s);
+        }
+        REAL3 gVec_sam = rotate_vector(rMat_c0, rMat_c1, rMat_c2, gVec_c);
+        REAL3 gVec_lab = rotate_vector(rMat_s0, rMat_s1, rMat_s2, gVec_sam);
+        REAL3 ray_vector;
+        if (params->has_beam)
+            ray_vector = diffract(vload3(0, params->beam), gVec_lab);
+        else
+            ray_vector = diffract_z(gVec_lab);
 
-    for (size_t pos_idx = pos_start; pos_idx<pos_end; pos_idx+=local_size)
-    {
-        REAL3 tVec_c = vload3(pos_idx, g_tVec_c);
 
-        REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
-        REAL2 projected = to_detector(rMat_d0, rMat_d1, rMat_d2, tVec_d, ray_origin, ray_vector);
-        vstore2(projected, gvec_idx*result_npos + pos_idx, g_xy_result);
+        __global REAL * restrict result_row = g_xy_result + 2*pos.x*chunk_size.y;
+
+        // change this to change how the work is executed locally (each thread
+        // working on contiguous npos or in an interleaved way).
+        uint thread_start = pos.y + local_id.y*pt_size.y;
+        uint thread_stop = min(thread_start+pt_size.y, chunk_size.y);
+        uint thread_step = 1;
+        uint npos_computed = 0;
+#if 0
+printf("tile: (%u, %u) tile_size: (%u, %u)\n",
+       tile_pos.x, tile_pos.y, tile_size.x, tile_size.y);
+#endif
+#if 0
+if (pos.x == 0)
+printf("gvec: %u npos: %u -> %u (%u step) (%u -> %u [%u]) chunk: (%u, %u) %p\n"
+       "\toffset: (%u, %u) global_pos: (%u, %u)\n",
+        pos.x, thread_start, thread_stop, thread_step,
+        pos.y, pos.y + chunk_size.y, local_id.y, chunk_size.x, chunk_size.y,
+        result_row,
+        offset.x, offset.y, global_pos.x, global_pos.y
+      );
+#endif
+        for (uint pos_idx = thread_start; pos_idx < thread_stop; pos_idx += thread_step)
+        {
+            // pos_idx is the kernel-relative position index. Add the offset to have
+            // the effective pos in the g_tVec_c array. 
+            REAL3 tVec_c = vload3(offset.y+pos_idx, g_tVec_c);
+
+            REAL3 ray_origin = transform_vector(tVec_s, rMat_s0, rMat_s1, rMat_s2, tVec_c);
+            REAL2 projected = to_detector(rMat_d0, rMat_d1, rMat_d2, tVec_d, ray_origin, ray_vector);
+
+            // store should be relative to the current kernel call. The result array
+            // is contiguous, being in position major order. That is, the xy pair
+            // for consecutive positions are consecutive. Note that the resulting
+            // array is compact and with space only for the results of this kernel
+            // execution, so when computing the offset, the gvec_idx used must be
+            // the kernel relative version. result_npos must be the total number of
+            // positions handled in this kernel. And the position index must be the
+            // one relative to the position start of this kernel.
+#if 0
+printf("stored result (%u, %u) at %p.\n"
+       " G: %9.6f, %9.6f, %9.6f\n"
+       "tC: %9.6f, %9.6f, %9.6f\n"
+       "xy: %9.6f, %9.6f\n",
+       global_pos.x, offset.y+pos_idx, result_row+2*pos_idx,
+       gVec_c.x, gVec_c.y, gVec_c.z,
+       tVec_c.x, tVec_c.y, tVec_c.z,
+       projected.x, projected.y);
+#endif
+            vstore2(projected, pos_idx, result_row);
+            //vstore2(projected, 0, result_row+2*pos_idx);
+            npos_computed++;
+        }
     }
 }
 )CLC";
@@ -635,7 +771,6 @@ copy_convert_chunk(void * restrict dst, size_t dst_size_in_bytes,
                    const size_t *dims, const ptrdiff_t *strides,
                    size_t ndim)
 {
-    void *limit = byte_index(dst, dst_size_in_bytes);
 #if defined(CLXF_LOG_COPY_CONVERT) && CLXF_LOG_COPY_CONVERT
     printf("copy_convert (begin): %p - %p(%s) <- %p(%s)\n",
            dst, limit,
@@ -651,12 +786,6 @@ copy_convert_chunk(void * restrict dst, size_t dst_size_in_bytes,
         curr_pos[i] = 0;
 
     do {
-        if (out > limit)
-        {
-            printf("BAD-BAD-BAD: will write past limit (%p)\n", limit);
-            print_dims("\t\tdims", curr_pos, ndim);
-            printf("\t\t\tinto %p (%p) offset = %zd\n", out, dst, out - static_cast<DST_REAL*>(dst));
-        }
         *out++ = *ndim_index(in, curr_pos, strides, ndim);
     } while(next_element(curr_pos, dims, ndim));
 #if defined(CLXF_LOG_COPY_CONVERT) && CLXF_LOG_COPY_CONVERT
@@ -692,9 +821,41 @@ copy_convert_chunk_out(void * restrict dst,
 #endif
 }
 
+struct cl_mem_transfer_context
+{
+    cl_mem_transfer_context(cl_command_queue q, cl_mem b);
+    ~cl_mem_transfer_context();
+
+    cl_mem_transfer_context(const cl_mem_transfer_context&) = delete;
+    
+    cl_command_queue queue;
+    cl_mem staging_buffer;
+    size_t staging_size;
+    void* staging_mem;
+};
+
+inline
+cl_mem_transfer_context::cl_mem_transfer_context(cl_command_queue q, cl_mem b):
+    queue(q), staging_buffer(b)
+{
+    CL_LOG_CHECK(clGetMemObjectInfo(b, CL_MEM_SIZE, sizeof(staging_size),
+                                    &staging_size, NULL));
+    staging_mem = clEnqueueMapBuffer(queue, staging_buffer,
+                                     CL_TRUE, CL_MAP_READ|CL_MAP_WRITE,
+                                     0, staging_size,
+                                     0, NULL, NULL, NULL);
+}
+
+inline
+cl_mem_transfer_context::~cl_mem_transfer_context()
+{
+    CL_LOG_CHECK(clEnqueueUnmapMemObject(queue, staging_buffer,
+                                         staging_mem, 0, NULL, NULL));
+}
+
 template <typename REAL>
 inline array_copy_convert_error
-copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
+copy_convert_to_buffer(cl_mem_transfer_context& ctx, cl_mem buffer,
                        const stream_desc *stream, const size_t *pos,
                        const size_t *sz, size_t ndim)
 { TIME_SCOPE("copy_convert_to_buffer");
@@ -725,8 +886,7 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
     const void *src = ndim_index(stream->base, pos, strides,
                                  stream->stream_ndim());
 
-    // printf("q: %p b: %p - WRITE_INVALIDATE - sz: %zd.\n", queue, buffer, total_size);
-    void *dst = clEnqueueMapBuffer(queue, buffer, CL_TRUE,
+    void *dst = clEnqueueMapBuffer(ctx.queue, buffer, CL_TRUE,
                                    CL_MAP_WRITE_INVALIDATE_REGION,
                                    0, total_size, 0, NULL, NULL, NULL);
     switch(stream->base_type)
@@ -741,95 +901,80 @@ copy_convert_to_buffer(cl_command_queue queue, cl_mem buffer,
         // this should not happen, should be caught at pre-condition
         err = UNEXPECTED_ERROR;
     }
-    clEnqueueUnmapMemObject(queue, buffer, dst, 0, NULL, NULL);
+    clEnqueueUnmapMemObject(ctx.queue, buffer, dst, 0, NULL, NULL);
 
     return err;
 }
 
-// perform a cl_buffer to main memory slicing to a max size so that DMA and
-// memcpy may be overlapped.
+// approach the copy in a very agnostic way. Just dma as much as possible and
+// fill strided...
 static void
-sliced_buff_to_mem(cl_command_queue queue, cl_mem buffer, void *dst,
-                   size_t total_size, size_t slice_size)
-{
-    const size_t SLICE_SIZE = slice_size;
-
-    if (total_size < 2*SLICE_SIZE)
-    {   TIME_SCOPE("sliced_buff_to_mem: under threshold");
-        void *src;
-        {
-            src = clEnqueueMapBuffer(queue, buffer, CL_TRUE, CL_MAP_READ, 0,
-                                     total_size, 0, NULL, NULL, NULL);
+sliced_buff_to_mem(cl_mem_transfer_context& ctx, cl_mem buffer, void *dst,
+                   size_t inner_size, ptrdiff_t stride, size_t count)
+{ TIME_SCOPE("sliced_buff_to_mem");
+    //    printf("sliced_buff_to_mem - dst: %p row_size: %zd stride: %zd count: %zd\n",
+    //       dst, inner_size, stride, count);
+    cl_event pending[2] = { 0, 0};
+    int db_cpu = 0, db_dma = 0;
+    size_t slice_size = ctx.staging_size/2;
+    size_t buffer_offset[2] = { 0, slice_size };
+    void *buffer_ptr[2] = { ctx.staging_mem, byte_index(ctx.staging_mem, slice_size) };
+    size_t copied_cpu = 0, copied_dma = 0, to_copy = inner_size*count;
+    size_t in_row_offset = 0;
+    if (stride == (ptrdiff_t)inner_size)
+    { // this will coalesce all rows into a single one if they happen to be
+      // contiguous
+        inner_size = to_copy;
+    }
+    while (copied_cpu < to_copy)
+    {
+        while (copied_dma < to_copy && !pending[db_dma])
+        { // if not everything has been dma'd and dma is available, enqueue
+            size_t transfer_size = std::min(slice_size, to_copy-copied_dma);
+            //printf("queued_dma [%d]: size: %zd\n", db_dma, transfer_size);
+            CL_LOG_CHECK(clEnqueueCopyBuffer(ctx.queue, buffer, ctx.staging_buffer,
+                                             copied_dma, buffer_offset[db_dma],
+                                             transfer_size,
+                                             0, NULL, &pending[db_dma]));
+            db_dma = 1 - db_dma;
+            copied_dma += transfer_size;
         }
-        memcpy(dst, src, total_size);
-    }
-    else
-    {   TIME_SCOPE("sliced_buff_to_mem: the real deal");
-        cl_context the_context;
-        cl_mem pinned_buffer;
-        void *staging_mem;
-        cl_event pending[2];
-        int curr_buff = 0, next_buff = 1; // buffer that needs memcpy...
-        size_t curr_offset = 0;
-        size_t next_offset = SLICE_SIZE;
-        CL_LOG_CHECK(clGetCommandQueueInfo(queue, CL_QUEUE_CONTEXT, sizeof(the_context), &the_context, NULL));
-        pinned_buffer = clCreateBuffer(the_context, CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
-                                       2*SLICE_SIZE, NULL, NULL);
-
-        staging_mem = clEnqueueMapBuffer(queue, pinned_buffer, CL_TRUE, CL_MAP_READ,
-                                        0, 2*SLICE_SIZE, 0, NULL, NULL, NULL);
-
-        CL_LOG_CHECK(clEnqueueCopyBuffer(queue, buffer, pinned_buffer, curr_offset, curr_buff*SLICE_SIZE,
-                                         SLICE_SIZE, 0, NULL, pending + curr_buff));
-        /*
-        staging[curr_buff] = clEnqueueMapBuffer(queue, buffer, CL_FALSE, CL_MAP_READ,
-                                                curr_offset, SLICE_SIZE, 0, NULL,
-                                                pending + curr_buff, NULL);
-        */
-        do {
-            // copy next
-            CL_LOG_CHECK(clEnqueueCopyBuffer(queue, buffer, pinned_buffer, next_offset, next_buff*SLICE_SIZE,
-                                             std::min(SLICE_SIZE, total_size-next_offset), 0, NULL, pending+next_buff));
-            /*
-            staging[1-curr_buff] = clEnqueueMapBuffer(queue, buffer, CL_FALSE, CL_MAP_READ,
-                                                      next_offset, std::min(SLICE_SIZE, total_size-next_offset),
-                                                      0, NULL, pending + (1-curr_buff), NULL);
-            */
-            // wait for dma for current to finish
-            CL_LOG_CHECK(clWaitForEvents(1, pending+curr_buff));
-
-            // memcpy current buffer
-            memcpy(byte_index(dst, curr_offset),
-                   byte_index(staging_mem, curr_buff*SLICE_SIZE), SLICE_SIZE);
-
-            /*
-            // unmap previous buffer
-            clEnqueueUnmapMemObject(queue, buffer, staging[curr_buff], 0, NULL, NULL);
-            */
-            curr_buff = 1-curr_buff;
-            next_buff = 1-next_buff;
-            curr_offset += SLICE_SIZE;
-            next_offset += SLICE_SIZE;
-        } while(next_offset < total_size);
-
-        // last buffer needs memcpying
-        CL_LOG_CHECK(clWaitForEvents(1, pending+curr_buff));
-        memcpy(byte_index(dst, curr_offset),
-               byte_index(staging_mem, curr_buff*SLICE_SIZE), total_size-curr_offset);
-        //clEnqueueUnmapMemObject(queue, buffer, staging[curr_buff], 0, NULL, NULL);
-
-        CL_LOG_CHECK(clEnqueueUnmapMemObject(queue, pinned_buffer, staging_mem, 0, NULL, NULL));
-        CL_LOG_CHECK(clReleaseMemObject(pinned_buffer));
-    }
+        // at this point, wait for the dma associated with the current transfer
+        // to finish and perform the memory copies
+        CL_LOG_CHECK(clWaitForEvents(1, &pending[db_cpu]));
+        CL_LOG_CHECK(clReleaseEvent(pending[db_cpu]));
+        pending[db_cpu] = 0;
+        void *src = buffer_ptr[db_cpu];
+        size_t copy_size = std::min(slice_size, to_copy - copied_cpu);
+        size_t copied = 0;
+        while (copied < copy_size)
+        {
+            size_t size = std::min(inner_size - in_row_offset,
+                                   copy_size - copied);
+            //printf("copying mem [%d] dst: %p size: %zd.\n", db_cpu, byte_index(dst, in_row_offset), size);
+            memcpy(byte_index(dst, in_row_offset),
+                   byte_index(src, copied),
+                   size);
+            copied += size;
+            in_row_offset += size;
+            if (in_row_offset >= inner_size)
+            { // change row. Note that == should work just as well... > would mean an error.
+                dst = byte_index(dst, stride);
+                in_row_offset = 0;
+            }
+        }
+        copied_cpu += copy_size;
+        db_cpu = 1 - db_cpu;  
+    } 
 }
+
 
 template <typename REAL>
 inline array_copy_convert_error
-copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
+copy_convert_from_buffer(cl_mem_transfer_context& ctx, cl_mem buffer,
                          const stream_desc *stream, const size_t *pos,
                          const size_t *sz, size_t ndim)
-{
-    TIME_SCOPE("copy_convert_from_buffer");
+{ TIME_SCOPE("copy_convert_from_buffer");
     array_copy_convert_error err = NO_ERROR;
     if (ndim != stream->stream_ndim())
         return DIM_ERROR;
@@ -865,41 +1010,25 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
         total_size *= stream->element_dims()[i];
     }
 
-    // check for trivial layout of the stream...
-    bool trivial_layout = true;
-    {
-        if (numpy_type<REAL>() == stream->base_type)
-        {
-            // check if strides are just the size of the underlying dimensions
-            ptrdiff_t contiguous_stride = sizeof(REAL);
-            int i;
-            for (i = total_ndim-1; i>=0; i--)
-            {
-                if (strides[i] != contiguous_stride)
-                    break;
-                contiguous_stride *= dims[i];
-            }
-            // at this point, i should have the dimension upto which the inner
-            // dimensions are trivial, and sz the size of those inner dimensions
-            // ... this could be used for some optimization.
-            trivial_layout = i < 0;
-        }
-        else
-        {
-            // bad luck, needs conversion...
-            trivial_layout = false;
-        }
-    }
+    bool needs_conversion = numpy_type<REAL>() != stream->base_type;
+    int non_contiguous_dimensions = total_ndim;
+    ptrdiff_t contiguous_size = sizeof(REAL);
+    while (non_contiguous_dimensions &&
+           strides[non_contiguous_dimensions-1] == contiguous_size)
+        contiguous_size *= dims[--non_contiguous_dimensions];
 
-    if (trivial_layout)
-    { /* do this in slices to see how fast we can go */
-        sliced_buff_to_mem(queue, buffer, dst, total_size, CLXF_PREFERRED_SLICE_SIZE);
+    /* at this point, non_contiguous_dimensions holds the number of dimensions
+       that need to be iterated upon, copying contiguous_size/sizeof(REAL)
+       elements (or memcpying contiguous_size if no conversion is needed */
+    if (!needs_conversion && 1 >= non_contiguous_dimensions)
+    { TIME_SCOPE("copy_convert_from_buffer: memcpy optimized");
+        sliced_buff_to_mem(ctx, buffer, dst, total_size/dims[0], strides[0], dims[0]);
     }
     else
-    {
+    { TIME_SCOPE("copy_convert_from_buffer: generic case");
         void *src;
         { TIME_SCOPE("copy_convert_from_buffer: clEnqueueMapBuffer");
-            src = clEnqueueMapBuffer(queue, buffer, CL_TRUE, CL_MAP_READ, 0,
+            src = clEnqueueMapBuffer(ctx.queue, buffer, CL_TRUE, CL_MAP_READ, 0,
                                      total_size, 0, NULL, NULL, NULL);
         }
 
@@ -915,7 +1044,7 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
         default:
             err = UNEXPECTED_ERROR;
         }
-        clEnqueueUnmapMemObject(queue, buffer, src, 0, NULL, NULL);
+        clEnqueueUnmapMemObject(ctx.queue, buffer, src, 0, NULL, NULL);
     }
 
     return err;
@@ -924,6 +1053,7 @@ copy_convert_from_buffer(cl_command_queue queue, cl_mem buffer,
 template <typename REAL>
 static inline void
 execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
+                     cl_mem_transfer_context& ctx,
                      g2xy_params<REAL>& params,
                      g2xy_host_info& host_info,
                      g2xy_buffs& buffs)
@@ -934,10 +1064,23 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
         round_up_divide(params.total_size[0], params.chunk_size[0]),
         round_up_divide(params.total_size[1], params.chunk_size[1])
     };
-    int curr_buff = 0; //, next_buff = 1;
 
-    size_t chunk_size[2] = {params.chunk_size[0], params.chunk_size[1]};
-    size_t chunk_offset[2];
+    // this will generate the actual get_global_id(0), get_global_id(1) inside
+    // the kernel. This should be tile based, as it will generate one entry
+    // per workgroup. Each workgroup will use its own indexing as well within
+    // the tile.
+    size_t work_size[2] = {
+        round_up_divide(params.chunk_size[0],params.tile_size[0])*host_info.kernel_local_size[0],
+        round_up_divide(params.chunk_size[1],params.tile_size[1])*host_info.kernel_local_size[1]
+    };
+    #if 0
+    debug_print_dims("chunks to run", chunk_dims, 2);
+    debug_print_dims("work_size", work_size, 2);
+    debug_print_array("chunk_size", params.chunk_size, 2, "%u");
+    debug_print_array("tile_size", params.tile_size, 2, "%u");
+    debug_print_array("local_size", host_info.kernel_local_size, 2, "%zu");
+    #endif
+    size_t count = 0;
     do
     {
         { TIME_SCOPE("cl_gvec_to_xy - launch kernel (chunked)");
@@ -947,13 +1090,12 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
             CL_LOG_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buffs.gvec_c));
             CL_LOG_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &buffs.rmat_s));
             CL_LOG_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &buffs.tvec_c));
-            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),
-                                        &buffs.xy_result[curr_buff]));
+            CL_LOG_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &buffs.xy_result[0]));
 
-            chunk_offset[0] = curr_chunk[0]*params.chunk_size[0];
-            chunk_offset[1] = curr_chunk[1]*params.chunk_size[1];
+            //debug_print_dims("chunk", curr_chunk, 2);
+            //debug_print_dims("\tsize", work_size, 2);
             CL_LOG_CHECK(clEnqueueNDRangeKernel(queue, kernel, 2,
-                                                chunk_offset, chunk_size,
+                                                curr_chunk, work_size,
                                                 host_info.kernel_local_size,
                                                 0, NULL,
                                                 NULL));
@@ -961,23 +1103,31 @@ execute_g2xy_chunked(cl_command_queue queue, cl_kernel kernel,
         }
 
         { TIME_SCOPE("cl_gvec_to_xy - copy results (chunked)");
-            size_t this_chunk_size[2] = {
-                std::min(chunk_size[0], params.total_size[0] - chunk_offset[0]),
-                std::min(chunk_size[1], params.total_size[1] - chunk_offset[1])
+            size_t chunk_offset[2] = {
+                curr_chunk[0]*params.chunk_size[0],
+                curr_chunk[1]*params.chunk_size[1]
             };
-            copy_convert_from_buffer<REAL>(queue, buffs.xy_result[0],
+            size_t this_chunk_size[2] = {
+                std::min<size_t>(params.chunk_size[0], params.total_size[0] - chunk_offset[0]),
+                std::min<size_t>(params.chunk_size[1], params.total_size[1] - chunk_offset[1])
+            };
+            //debug_print_dims("chunk (mem)", curr_chunk, 2);
+            //debug_print_dims("\toffset", chunk_offset,2);
+            //debug_print_dims("\tsize", this_chunk_size, 2);
+            copy_convert_from_buffer<REAL>(ctx, buffs.xy_result[0],
                                            &host_info.xy_out_stream,
                                            chunk_offset, this_chunk_size, 2);
-            clFinish(queue);
+            clFinish(ctx.queue);
         }
-
+        count++;
     } while (next_element(curr_chunk, chunk_dims, 2));
-
+    //printf("%zd chunks run.\n", count);
 }
 
 template <typename REAL>
 static inline void
 execute_g2xy_oneshot(cl_command_queue queue, cl_kernel kernel,
+                     cl_mem_transfer_context& ctx,
                      g2xy_params<REAL>& params,
                      g2xy_host_info& host_info,
                      g2xy_buffs &buffs)
@@ -1004,10 +1154,10 @@ execute_g2xy_oneshot(cl_command_queue queue, cl_kernel kernel,
             std::min(chunk_size[0], params.total_size[0] - chunk_offset[0]),
             std::min(chunk_size[1], params.total_size[1] - chunk_offset[1])
         };
-        copy_convert_from_buffer<REAL>(queue, buffs.xy_result[0],
+        copy_convert_from_buffer<REAL>(ctx, buffs.xy_result[0],
                                        &host_info.xy_out_stream,
                                        chunk_offset, this_chunk_size, 2);
-        clFinish(queue);
+        clFinish(ctx.queue);
     }
 }
 
@@ -1018,8 +1168,7 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
               PyArrayObject *tVec_d, PyArrayObject *tVec_s, PyArrayObject *tVec_c,
               PyArrayObject *beam_vec, // may be nullptr
               PyArrayObject *result_xy_array)
-{
-    TIME_SCOPE("cl_gvec_to_xy");
+{ TIME_SCOPE("cl_gvec_to_xy");
     auto cl = cl_instance::instance();
     if (!cl)
         return -1;
@@ -1056,41 +1205,41 @@ cl_gvec_to_xy(PyArrayObject *gVec_c,
         size_t ngvec = static_cast<size_t>(params.total_size[0]);
         size_t npos = static_cast<size_t>(params.total_size[1]);
         size_t zero = 0;
+
+        cl_mem_transfer_context ctx(cl->mem_queue, cl->staging_buffer);
         /* Right now, all inputs are assumed to fit into device memory */
         { TIME_SCOPE("cl_gvec_to_xy - copy args");
-            copy_convert_to_buffer<REAL>(queue, buffs.gvec_c,
+            copy_convert_to_buffer<REAL>(ctx, buffs.gvec_c,
                                          &host_info.gVec_c_stream,
                                          &zero, &ngvec, 1);
-            copy_convert_to_buffer<REAL>(queue, buffs.rmat_s,
+            copy_convert_to_buffer<REAL>(ctx, buffs.rmat_s,
                                          &host_info.rMat_s_stream,
                                          &zero, &ngvec, 1);
-            copy_convert_to_buffer<REAL>(queue, buffs.tvec_c,
+            copy_convert_to_buffer<REAL>(ctx, buffs.tvec_c,
                                          &host_info.tVec_c_stream,
                                          &zero, &npos, 1);
 
-            clFinish(queue);
+            clFinish(ctx.queue);
         }
 
-        if (params.chunk_size[0] <= params.total_size[0] ||
-            params.chunk_size[1] <= params.total_size[1])
-        {
-            execute_g2xy_chunked(queue, kernel, params, host_info, buffs);
-        }
-        else
-        {
-            execute_g2xy_oneshot(queue, kernel, params, host_info, buffs);
-        }
-
-        release_g2xy_buffs(&buffs);
+        //if (params.chunk_size[0] <= params.total_size[0] ||
+        //    params.chunk_size[1] <= params.total_size[1])
+        //{
+        execute_g2xy_chunked(queue, kernel, ctx, params, host_info, buffs);
+        //}
+        //else
+        // {
+        //execute_g2xy_oneshot(queue, kernel, ctx, params, host_info, buffs);
+        //}
     }
+    release_g2xy_buffs(&buffs);
 
     return 0;
 }
 
 XRD_PYTHON_WRAPPER PyObject *
 python_cl_gvec_to_xy(PyObject *self, PyObject *args, PyObject *kwargs)
-{
-    TIME_SCOPE("python wrapper");
+{ TIME_SCOPE("python wrapper");
     static const char *kwlist[] = {"gvec_c", "rmat_d", "rmat_s", "rmat_c", "tvec_d",
         "tvec_s", "tvec_c", "beam_vec", "single_precision", nullptr};
     const char* parse_tuple_fmt = "O&O&O&O&O&O&O&|O&p";

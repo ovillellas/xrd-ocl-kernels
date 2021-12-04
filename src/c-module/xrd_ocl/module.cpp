@@ -17,15 +17,8 @@
  */
 #define THIS_MODULE_NAME xrd_ocl
 
-#define _CONCAT(a,b) a ## b
-#define CONCAT(a,b) _CONCAT(a,b)
-#define _STR(a) # a
-#define STR(a) _STR(a)
-
 /* ************************************************************************** */
 
-
-#include "compiler.hpp"
 extern "C" {
 #include <Python.h>
 
@@ -34,6 +27,9 @@ extern "C" {
 }
 
 #include <OpenCL/opencl.h>
+
+#include "compiler.hpp"
+#include "dev_help.hpp"
 
 
 

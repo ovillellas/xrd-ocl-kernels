@@ -16,6 +16,9 @@ import functools
 import xrd_transforms
 import xrd_ocl_kernels
 
+# seed the rng with some constant value to get reproducible results.
+rng = np.random.default_rng(seed=42)
+
 def with_keywords(kwargs):
     '''decorator that will call the decorated function with the kwarg'''
     def decorator(func):
@@ -56,8 +59,10 @@ def make_multi_npos_gvec_to_xy(gvec_to_xy_func):
 def some_fancy_generator_of_unit_vectors(count):
     """return a (COUNT,3) array of COUNT normalized 3-vectors"""
     # not that fancy, but data values should not matter
-    result = np.zeros((count,3))
-    result[:,1] = 1.0
+    result = rng.random((count, 3))
+    result /= np.linalg.norm(result, axis = -1)[..., np.newaxis]
+    # result = np.zeros((count,3))
+    # result[:,1] = 1.0
     return result
 
 def some_fancy_generator_of_rotation_matrices(count):
@@ -100,7 +105,7 @@ def build_args(ngvec, npos, single_s):
     tvec_d = np.array([ 0. ,  1.5, -5. ])
     tvec_s = np.array([0., 0., 0.])
 
-    tvec_c = np.random.random((npos, 3))
+    tvec_c = rng.random((npos, 3))
 #    tvec_c = np.array([[-0.25, -0.25, -0.25]])
 
     # return all as a tuple for convenience when calling...

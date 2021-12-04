@@ -2,6 +2,9 @@
 #include "dev_help.hpp"
 #include "utils.hpp"
 
+#define CLXF_STAGING_BUFFER_SIZE ((size_t)4*1024*1024)
+
+
 cl_kernel kernel_cache[cl_instance::kernel_slot::count];
 static cl_instance *the_instance;
 
@@ -135,6 +138,10 @@ cl_instance::~cl_instance()
         if (kernel_cache[i])
             CL_LOG_CHECK(clReleaseKernel(kernel_cache[i]));
     }
+    if (staging_buffer)
+        CL_LOG_CHECK(clReleaseMemObject(staging_buffer));
+    if (mem_queue)
+        CL_LOG_CHECK(clReleaseCommandQueue(mem_queue));
     if (queue)
         CL_LOG_CHECK(clReleaseCommandQueue(queue));
     if (context)
@@ -167,15 +174,21 @@ bool cl_instance::init()
     clGetPlatformIDs(1, &platform, NULL); // by default, the first platform
     clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL); // first GPU
 
-    { TIME_SCOPE("clCreateContext");
+    { TIME_SCOPE("Create CL context");
         context = clCreateContext(0, 1, &device, error_notify_callback, NULL,
                                   NULL);
     }
 
-    { TIME_SCOPE("clCreateCommandQueue");
+    { TIME_SCOPE("Create CL command queue");
         queue = clCreateCommandQueue(context, device, 0, NULL);
     }
 
+    { TIME_SCOPE("Create memory transfer channel");
+        mem_queue = clCreateCommandQueue(context, device, 0, NULL);
+
+        staging_buffer = clCreateBuffer(context, CL_MEM_ALLOC_HOST_PTR,
+                                        CLXF_STAGING_BUFFER_SIZE, NULL, NULL);
+    }
     return context && queue;
 }
 

@@ -469,38 +469,45 @@ print_stream(const char *name, const STREAM_DESC& stream)
     }
 }
 
-
+template <typename TYPE>
 static inline void
-print_dims(const char *name, const size_t *dims, size_t ndim)
+debug_print_array(const char *name, const TYPE *vect, size_t ndim,
+             const char *elfmt, const char *fmt=0)
 {
+    if (!fmt || strlen(fmt) < 4)
+        fmt = "[,]\n";
+
+    if (name)
+        printf("%s ", name);
+    
     if (0 == ndim)
     {
-        printf("%s: no dimensions\n", name);
+        printf("%c %c%c", fmt[0], fmt[2], fmt[3]);
     }
     else
     {
-        printf("%s: [ %zu", name, dims[0]);
+        printf("%c ", fmt[0]);
+        printf(elfmt, vect[0]);
         for (size_t i=1; i<ndim; i++)
-            printf(", %zu", dims[i]);
-        printf(" ]\n");
+        {
+            printf("%c ", fmt[1]);
+            printf(elfmt, vect[i]);
+        }
+        printf(" %c%c", fmt[2], fmt[3]);
     }
+}
+
+static inline void
+debug_print_dims(const char *name, const size_t *dims, size_t ndim)
+{
+    debug_print_array(name, dims, ndim, "%zu");
 }
 
 
 static inline void
-print_strides(const char *name, const ptrdiff_t *strides, size_t ndim)
+debug_print_strides(const char *name, const ptrdiff_t *strides, size_t ndim)
 {
-    if (0 == ndim)
-    {
-        printf("%s: no dimensions\n", name);
-    }
-    else
-    {
-        printf("%s: [ %zd", name, strides[0]);
-        for (size_t i=1; i<ndim; i++)
-            printf(", %zd", strides[i]);
-        printf(" ]\n");
-    }
+    debug_print_array(name, strides, ndim, "%zd");
 }
 
 #endif
