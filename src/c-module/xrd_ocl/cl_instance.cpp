@@ -8,6 +8,56 @@
 cl_kernel kernel_cache[cl_instance::kernel_slot::count];
 static cl_instance *the_instance;
 
+
+static const char *
+load_file(const char *dir, const char *name, const char *default_content)
+{
+    // this is just to allow tweaking kernels without recompiling...
+    const char *ret_val = default_content;
+    char path_buffer[256];
+    char *ppath = path_buffer;
+    size_t path_size = sizeof(path_buffer);
+    do {
+        size_t actual_size;
+        actual_size = snprintf(path_buffer, sizeof(path_buffer),
+                               "%s/%s.cl", dir, name);
+        if (actual_size < path_size + 1)
+            break;
+
+        // note: in next iteration it should leave via the break
+        path_size = actual_size+1;
+        ppath = (char *)malloc(path_size);
+    } while (1);
+
+    FILE *f = fopen(ppath, "rb");
+    if (NULL != f)
+    {
+        fseek(f, 0, SEEK_END);
+        auto fsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        char *contents = (char *)malloc(fsize+1);
+        if (contents)
+        {
+            fread(contents, fsize, 1, f);
+            contents[fsize] = '\0';
+            ret_val = contents;
+        }
+
+        fclose(f);
+    }
+
+    if (ret_val != default_content)
+    {
+        printf("overrode kernel %s with contents of '%s'.\n", name, path_buffer);
+    }
+
+    if (ppath != path_buffer)
+        free(ppath);
+
+    return ret_val;
+}
+
 cl_kernel
 cl_instance::build_kernel(const char *kernel_name, const char *source,
                           const char *compile_options)
@@ -15,6 +65,16 @@ cl_instance::build_kernel(const char *kernel_name, const char *source,
     TIME_SCOPE("build_kernel");
     cl_program program;
     cl_kernel kernel;
+
+    // override kernel support
+    const char *kernel_directory = getenv("CLXF_KERNEL_DIR");
+    const char *alt_src = 0;
+    if (kernel_directory)
+    {
+        alt_src = load_file(kernel_directory, kernel_name, source);
+        if (alt_src)
+            source = alt_src;
+    }
 
     program = clCreateProgramWithSource(context, 1, &source, NULL, NULL);
 
@@ -93,6 +153,9 @@ cl_instance::build_kernel(const char *kernel_name, const char *source,
 #endif
     }
     clReleaseProgram(program);
+
+    if (alt_src)
+        free((void*)alt_src);
 
     return kernel;
 }

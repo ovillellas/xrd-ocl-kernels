@@ -57,7 +57,6 @@ private:
     const char *tag;
     clock::time_point start;
 };
-#  define TIME_SCOPE(name) scope_timer CONCAT(scptmr_,__LINE__)(name)
 
 static inline void
 cl_log_event_profile(const char* name, cl_event event)
@@ -78,10 +77,68 @@ cl_log_event_profile(const char* name, cl_event event)
            (time_end-time_start)*factor, (time_submit-time_queued)*factor);
 }
 
-#  define CL_LOG_EVENT_PROFILE(name, event) do { cl_log_event_profile(name, event); } while(0)
+
+struct clxf_cumulative_event_profiler
+{
+    clxf_cumulative_event_profiler(const char *name_in):
+        name(name_in),
+        total_calls(0),
+        total_executing(0),
+        total_waiting(0),
+        total_queued(0)
+    {
+    }
+
+    ~clxf_cumulative_event_profiler()
+    {
+        do_report();
+    }
+
+    void do_report()
+    {
+        if (total_calls < 1)
+            return;
+        
+        double f_avg = 1e-6/total_calls;
+        double f_total = 1e-6;
+        printf("TIMER (cl_event): %s [x%4zd]\n"
+               "\t  avg: %9.6f ms exe %9.6f ms wait %9.6f ms queued\n"
+               "\ttotal: %9.6f ms exe %9.6f ms wait %9.6f ms queued\n",
+               name, total_calls,
+               total_executing*f_avg, total_waiting*f_avg, total_queued*f_avg,
+               total_executing*f_total, total_waiting*f_total, total_queued*f_total);
+    }
+
+    void add_event(cl_event event)
+    {
+        cl_ulong queued, submitted, start, end;
+        clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_QUEUED, sizeof(queued), &queued, NULL);
+        clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_SUBMIT, sizeof(submitted), &submitted, NULL);
+        clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
+        clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
+
+        total_calls++;
+        total_executing += (end-start);
+        total_waiting += (start-submitted); // time from submit to start of execution, in device queue
+        total_queued += (submitted-queued); // time from queued to submit, waiting for device enqueue
+    }
+    
+    const char *name;        
+    size_t total_calls;
+    size_t total_executing;
+    size_t total_waiting;
+    size_t total_queued;
+};
+
+#  define TIME_SCOPE(name) scope_timer CONCAT(scptmr_,__LINE__)(name)
+#  define CL_LOG_EVENT_PROFILE(name,event) do { cl_log_event_profile(name, event); } while(0)
+#  define CL_LOG_CUMULATIVE_PROFILE(name,str) clxf_cumulative_event_profiler name(str)
+#  define CL_LOG_CUMULATIVE_PROFILE_ADD(name,event) do { name.add_event(event); } while(0)
 #else
 #  define TIME_SCOPE(name) do {} while(0)
 #  define CL_LOG_EVENT_PROFILE(...) do {} while(0)
+#  define CL_LOG_CUMULATIVE_PROFILE(name,str)
+#  define CL_LOG_CUMULATIVE_PROFILE_ADD(name,event) do {} while(0)
 #endif
 
 // -----------------------------------------------------------------------------

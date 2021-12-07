@@ -45,6 +45,27 @@ static inline T* byte_index(T* base, ptrdiff_t offset)
     return reinterpret_cast<T*>(reinterpret_cast<char *>(base)+offset);
 }
 
+
+// ndim handling...
+
+// iterate on an n-dimensional index, making it point to the next.
+// returns false when it reaches the end of iteration.
+static inline bool
+ndim_next_element(size_t * restrict curr, const size_t *dims, size_t ndims)
+{
+    size_t it_pos = ndims;
+    while (it_pos--) {
+        if (++curr[it_pos] < dims[it_pos])
+        {
+            return true;
+        }
+        curr[it_pos] = 0;
+    }
+
+    return false;
+}
+
+
 template <typename T>
 inline const T *
 ndim_index(const T *base, const size_t *idx, const ptrdiff_t *strides, size_t ndim)
